@@ -834,6 +834,7 @@ def _finalize_run_outputs(sid: str) -> None:
             "launcher_auto_key_used",
             "launcher_final_cost_usd",
             "launcher_drive_folder_id",
+            "launcher_drive_folder_link",
         ]
         merged_fields = list(fieldnames)
         for col in extra_fields:
@@ -848,14 +849,20 @@ def _finalize_run_outputs(sid: str) -> None:
                 "launcher_ended_at_utc": ended_at,
                 "launcher_auto_key_used": "1" if state.get("auto_key_used") else "0",
                 "launcher_final_cost_usd": f"{cost:.8f}",
-                "launcher_drive_folder_id": os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip(),
+                "launcher_drive_folder_id": str(state.get("drive_run_folder_id") or os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")).strip(),
+                "launcher_drive_folder_link": str(state.get("drive_run_folder_link") or "").strip(),
             })
             if out.get("launcher_drive_html_links") and "launcher_drive_html_links" not in merged_fields:
                 merged_fields.append("launcher_drive_html_links")
             enriched_rows.append(out)
         _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
-        _append_rows_to_google_sheet("results", merged_fields, enriched_rows)
-        _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
+        has_drive_html_link = any(str(row.get("conversation_link", "")).startswith(("https://drive.google.com/", "http://drive.google.com/")) or bool(row.get("launcher_drive_html_links")) for row in enriched_rows)
+        if has_drive_html_link:
+            _append_rows_to_google_sheet("results", merged_fields, enriched_rows)
+            _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
+            state["download_sheets_synced_once"] = True
+        else:
+            _append_log("Google Sheets append skipped: no Google Drive HTML link was created, so local file links were not written to Sheets.")
 
     if state.get("auto_key_used"):
         cost = _latest_cost_value_from_logs(text)
