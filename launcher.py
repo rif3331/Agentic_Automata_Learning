@@ -298,68 +298,84 @@ def _append_rows_to_csv(path: Path, fieldnames: list[str], rows: list[dict[str, 
 
 
 def _append_rows_to_google_sheet(sheet_name: str, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
-    """Append rows to Google Sheets when GOOGLE_SHEET_ID and credentials are configured.
-
-    Render env vars supported:
-      GOOGLE_SHEET_ID
-      GOOGLE_SHEETS_CREDENTIALS_JSON  (service account JSON as one line)
-      GOOGLE_APPLICATION_CREDENTIALS  (path to service account JSON file)
-    """
+    """Append rows to Google Sheets when GOOGLE_SHEET_ID and credentials are configured."""
     if not fieldnames or not rows:
         return
     spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip()
     if not spreadsheet_id:
+        _append_log("Google Sheets append skipped: GOOGLE_SHEET_ID is not configured.")
+        return
+    info = _google_service_account_info()
+    if not info:
+        _append_log("Google Sheets append skipped: service-account credentials are not configured.")
         return
     try:
         import gspread
-        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "").strip()
-        if creds_json:
-            credentials = json.loads(creds_json)
-            gc = gspread.service_account_from_dict(credentials)
-        else:
-            gc = gspread.service_account()
+        from google.oauth2 import service_account
 
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        gc = gspread.authorize(creds)
         sh = gc.open_by_key(spreadsheet_id)
         try:
             ws = sh.worksheet(sheet_name)
         except Exception:
             ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=max(20, len(fieldnames)))
-            ws.append_row(fieldnames, value_input_option="RAW")
+            ws.append_row(fieldnames, value_input_option="USER_ENTERED")
 
         existing_header = ws.row_values(1)
         if not existing_header:
-            ws.append_row(fieldnames, value_input_option="RAW")
+            ws.append_row(fieldnames, value_input_option="USER_ENTERED")
+            existing_header = list(fieldnames)
         elif existing_header != fieldnames:
-            # Preserve old columns and append any new columns at the end.
             merged = list(existing_header)
             for name in fieldnames:
                 if name not in merged:
                     merged.append(name)
             if merged != existing_header:
-                ws.update("1:1", [merged])
+                ws.update("1:1", [merged], value_input_option="USER_ENTERED")
             fieldnames = merged
 
         values = [[str(row.get(col, "")) for col in fieldnames] for row in rows]
-        ws.append_rows(values, value_input_option="RAW")
+        if values:
+            ws.append_rows(values, value_input_option="USER_ENTERED")
+            _append_log(f"Google Sheets append complete ({sheet_name}): {len(values)} row(s).")
     except Exception as exc:
         _append_log(f"Google Sheets append failed ({sheet_name}): {type(exc).__name__}: {exc}")
 
 
-
-
 def _google_service_account_info() -> dict[str, Any] | None:
-    creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "").strip()
-    if creds_json:
+    json_env_names = (
+        "GOOGLE_SHEETS_CREDENTIALS_JSON",
+        "GOOGLE_SHEETS_CREDENTIALS",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "GOOGLE_CREDENTIALS_JSON",
+    )
+    for env_name in json_env_names:
+        creds_json = os.environ.get(env_name, "").strip()
+        if not creds_json:
+            continue
         try:
-            return json.loads(creds_json)
+            info = json.loads(creds_json)
+            private_key = str(info.get("private_key", ""))
+            if "\\n" in private_key:
+                info["private_key"] = private_key.replace("\\n", "\n")
+            return info
         except Exception as exc:
-            _append_log(f"Google credentials JSON parse failed: {type(exc).__name__}: {exc}")
+            _append_log(f"Google credentials JSON parse failed from {env_name}: {type(exc).__name__}: {exc}")
             return None
 
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if creds_path:
         try:
-            return json.loads(Path(creds_path).read_text(encoding="utf-8"))
+            info = json.loads(Path(creds_path).read_text(encoding="utf-8"))
+            private_key = str(info.get("private_key", ""))
+            if "\\n" in private_key:
+                info["private_key"] = private_key.replace("\\n", "\n")
+            return info
         except Exception as exc:
             _append_log(f"Google credentials file read failed: {type(exc).__name__}: {exc}")
             return None
@@ -375,14 +391,14 @@ def _google_drive_service():
 
     info = _google_service_account_info()
     if not info:
-        _append_log("Google Drive upload skipped: GOOGLE_SHEETS_CREDENTIALS_JSON is not configured.")
+        _append_log("Google Drive upload skipped: service-account credentials are not configured.")
         return None
 
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
 
-        scopes = ["https://www.googleapis.com/auth/drive.file"]
+        scopes = ["https://www.googleapis.com/auth/drive"]
         creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
         return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
@@ -797,6 +813,7 @@ def _finalize_run_outputs(sid: str) -> None:
                 merged_fields.append("launcher_drive_html_links")
             enriched_rows.append(out)
         _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
+        _append_rows_to_google_sheet("results", merged_fields, enriched_rows)
         _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
 
     if state.get("auto_key_used"):
