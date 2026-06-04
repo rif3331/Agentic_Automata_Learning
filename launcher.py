@@ -420,21 +420,102 @@ def _zip_relative_path_for_session_file(path: Path, out_dir: Path) -> str:
         return path.name
 
 
-def _localize_path_for_results_zip(value: str, sid: str, out_dir: Path) -> str:
-    """Convert server/local artifact URLs in downloaded results to paths inside the ZIP.
+def _normalize_zip_artifact_path(local: str, out_dir: Path) -> str:
+    """Prefer the path that actually exists in the session output tree."""
+    local = str(local or "").replace("\\", "/").lstrip("/")
+    if not local:
+        return local
+    direct = out_dir / local
+    nested_html = out_dir / "html" / local
+    if direct.exists():
+        return local
+    if nested_html.exists():
+        return (Path("html") / local).as_posix()
+    return local
 
-    The app itself still uses Render URLs while running. Only the downloaded ZIP
-    copy is rewritten so result rows point to files that exist inside the ZIP,
-    e.g. html/session_...html instead of file:////opt/render/.../html/session_...html.
+
+def _zip_path_from_server_path(value: str, sid: str, out_dir: Path) -> str:
+    """Return the artifact path inside the downloaded ZIP.
+
+    This accepts Render paths, Windows paths, file:// URLs, /html_artifact URLs,
+    and already-local artifact paths. The returned value is always a ZIP-local
+    path such as evaluations/x.html, language_similarity_details/x.html,
+    html/session_x.html, or DFA/x.html.
+    """
+    if not value:
+        return value
+
+    text = html_lib.unescape(str(value).strip())
+
+    html_artifact_match = re.search(r'/html_artifact\?[^\s,;"\'<>]*?path=([^&\s,;"\'<>]+)', text)
+    if html_artifact_match:
+        return _zip_path_from_server_path(unquote(html_artifact_match.group(1)), sid, out_dir)
+
+    local_file_match = re.search(r'/local_file\?[^\s,;"\'<>]*?path=([^&\s,;"\'<>]+)', text)
+    if local_file_match:
+        return _zip_path_from_server_path(unquote(local_file_match.group(1)), sid, out_dir)
+
+    if text.startswith("file:///"):
+        text = text[8:]
+    elif text.startswith("file://"):
+        text = text[7:]
+
+    text = unquote(text).replace("\\", "/")
+    text = re.sub(r"^[A-Za-z]:/", lambda m: m.group(0), text)
+    out_posix = out_dir.as_posix().rstrip("/")
+
+    if text.startswith(out_posix + "/"):
+        return _normalize_zip_artifact_path(text[len(out_posix) + 1:], out_dir)
+
+    session_fragment = f"runs/sessions/{sid}/"
+    idx = text.find(session_fragment)
+    if idx >= 0:
+        return _normalize_zip_artifact_path(text[idx + len(session_fragment):], out_dir)
+
+    generic = re.search(r"runs/sessions/[^/]+/(.+)$", text)
+    if generic:
+        return _normalize_zip_artifact_path(generic.group(1), out_dir)
+
+    known_dirs = (
+        "evaluations/",
+        "language_similarity_details/",
+        "L_star_comparisons/",
+        "TTT_comparisons/",
+        "DFA/",
+        "html/",
+    )
+
+    for known in known_dirs:
+        idx = text.find("/" + known)
+        if idx >= 0:
+            return _normalize_zip_artifact_path(text[idx + 1:], out_dir)
+        if text.startswith(known):
+            return _normalize_zip_artifact_path(text, out_dir)
+
+    return _normalize_zip_artifact_path(text, out_dir)
+
+
+def _localize_path_for_results_zip(value: str, sid: str, out_dir: Path) -> str:
+    """Convert server/local artifact URLs to zip-root relative paths.
+
+    This is used for results.csv and for plain text content. For HTML href/src
+    attributes use _localized_html_content_for_zip, which makes links relative
+    to the current HTML file location.
     """
     if not value:
         return value
 
     text = str(value)
 
+    stripped = text.strip()
+    if stripped.endswith(".html") and not re.search(r"\s", stripped) and (
+        stripped.startswith("file:") or "/html_artifact" in stripped or "runs/sessions" in stripped or "/opt/render" in stripped
+    ):
+        return _zip_path_from_server_path(stripped, sid, out_dir)
+
     def decode_html_artifact(match: re.Match[str]) -> str:
         raw = unquote(match.group(1))
-        return _localize_path_for_results_zip(raw, sid, out_dir)
+        return _zip_path_from_server_path(raw, sid, out_dir)
 
     text = re.sub(r'/html_artifact\?[^\s,;"\'<>]*?path=([^&\s,;"\'<>]+)[^\s,;"\'<>]*', decode_html_artifact, text)
 
@@ -454,17 +535,24 @@ def _localize_path_for_results_zip(value: str, sid: str, out_dir: Path) -> str:
     for prefix in prefixes:
         text = text.replace(prefix, "")
 
-    # Fallback for Render/Linux absolute paths, Windows paths, or any file URL
-    # containing a session output directory. Keep only the path inside it.
     text = re.sub(rf'file:/*[^\s,;"\'<>]*?{re.escape(session_fragment)}', '', text)
     text = re.sub(rf'file:/*[^\s,;"\'<>]*?{generic_session_fragment}', '', text)
     text = re.sub(rf'[A-Za-z]:[/\\][^\s,;"\'<>]*?{generic_session_fragment}', '', text)
     text = re.sub(rf'/[^\s,;"\'<>]*?{re.escape(session_fragment)}', '', text)
     text = re.sub(rf'/[^\s,;"\'<>]*?{generic_session_fragment}', '', text)
 
-    text = re.sub(r"file:/*(?=(html|DFA|L_star_comparisons|session_|graphs\.pdf))", "", text)
+    text = re.sub(r"file:/*(?=(html|DFA|L_star_comparisons|language_similarity_details|session_|graphs\.pdf))", "", text)
     return text.replace("\\", "/")
 
+
+def _make_clickable_csv_value(value: str, sid: str, out_dir: Path) -> str:
+    """Make HTML paths clickable when results.csv is opened in Sheets/Excel."""
+    localized = _localize_path_for_results_zip(value, sid, out_dir)
+    if localized.endswith(".html") and not localized.startswith("=HYPERLINK("):
+        safe_url = localized.replace('"', '""')
+        safe_label = localized.replace('"', '""')
+        return f'=HYPERLINK("{safe_url}","{safe_label}")'
+    return localized
 
 def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Path) -> str:
     if not session_csv.exists():
@@ -480,16 +568,134 @@ def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Pa
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: _localize_path_for_results_zip(str(row.get(k, "")), sid, out_dir) for k in fieldnames})
+            writer.writerow({k: _make_clickable_csv_value(str(row.get(k, "")), sid, out_dir) for k in fieldnames})
         return buf.getvalue()
     except Exception:
         return _localize_path_for_results_zip(raw, sid, out_dir)
 
 
-def _localized_html_content_for_zip(path: Path, sid: str, out_dir: Path) -> str:
-    content = path.read_text(encoding="utf-8", errors="replace")
-    return _localize_path_for_results_zip(content, sid, out_dir)
+def _results_html_table_for_zip(session_csv: Path, sid: str, out_dir: Path) -> str:
+    """Create a simple clickable HTML table that opens artifacts inside the ZIP."""
+    if not session_csv.exists():
+        return "<!DOCTYPE html><html><body><p>No results.csv found.</p></body></html>"
+    raw = session_csv.read_text(encoding="utf-8-sig", errors="replace")
+    try:
+        rows = list(csv.DictReader(raw.splitlines()))
+        fieldnames = csv.DictReader(raw.splitlines()).fieldnames or []
+    except Exception:
+        rows, fieldnames = [], []
 
+    def cell(value: object) -> str:
+        localized = _localize_path_for_results_zip(str(value or ""), sid, out_dir)
+        escaped = html_lib.escape(localized, quote=True)
+        if localized.endswith(".html"):
+            return f'<a href="{escaped}" target="_blank" rel="noopener">{escaped}</a>'
+        return escaped
+
+    head = "".join(f"<th>{html_lib.escape(str(h), quote=True)}</th>" for h in fieldnames)
+    body_rows = []
+    for row in rows:
+        body_rows.append("<tr>" + "".join(f"<td>{cell(row.get(h, ''))}</td>" for h in fieldnames) + "</tr>")
+
+    return f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Automata Run Results</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:24px;background:#f8fafc;color:#172033}}
+h1{{font-size:22px;margin:0 0 12px}}
+p{{color:#667085}}
+table{{border-collapse:collapse;width:100%;background:white;border:1px solid #d0d5dd}}
+th,td{{border:1px solid #d0d5dd;padding:8px 10px;font-size:12px;text-align:left;vertical-align:top;max-width:360px;word-break:break-word}}
+th{{background:#eef2f7;font-weight:800;position:sticky;top:0}}
+a{{color:#2563eb;text-decoration:underline}}
+</style>
+</head>
+<body>
+<h1>Automata Run Results</h1>
+<p>Open this file from the extracted ZIP folder. Links point to the local HTML files included in the ZIP.</p>
+<table>
+<thead><tr>{head}</tr></thead>
+<tbody>{''.join(body_rows)}</tbody>
+</table>
+</body>
+</html>'''
+
+
+def _localized_html_content_for_zip(path: Path, sid: str, out_dir: Path) -> str:
+    """Rewrite HTML artifacts so every link works after extracting the ZIP.
+
+    Important: links inside a ZIP opened directly from Windows Explorer may be
+    copied to a temporary folder by the OS. Cross-file links are only reliable
+    after the user extracts the ZIP. The links written here are therefore
+    relative to the extracted ZIP folder and do not contain Render/server paths.
+    """
+    content = path.read_text(encoding="utf-8", errors="replace")
+    current_arcname = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
+    current_dir = os.path.dirname(current_arcname)
+
+    def to_relative_link(raw: str) -> str:
+        raw = html_lib.unescape(str(raw or "").strip())
+        if not raw:
+            return raw
+        anchor = ""
+        if "#" in raw and not raw.startswith("#"):
+            raw, anchor = raw.split("#", 1)
+            anchor = "#" + anchor
+        local = _zip_path_from_server_path(raw, sid, out_dir).replace("\\", "/")
+        if not local.endswith(".html"):
+            localized = _localize_path_for_results_zip(raw, sid, out_dir)
+            return localized + anchor
+        rel = os.path.relpath(local, current_dir or ".").replace("\\", "/")
+        if rel == ".":
+            rel = os.path.basename(local)
+        return rel + anchor
+
+    def should_rewrite_url(url: str) -> bool:
+        u = html_lib.unescape(str(url or ""))
+        return (
+            u.endswith(".html")
+            or ".html#" in u
+            or "file:" in u
+            or "/html_artifact" in u
+            or "/local_file" in u
+            or "runs/sessions" in u
+            or "/opt/render" in u
+        )
+
+    def repl_attr(match: re.Match[str]) -> str:
+        attr, quote_char, url = match.group(1), match.group(2), match.group(3)
+        if should_rewrite_url(url):
+            return f'{attr}={quote_char}{html_lib.escape(to_relative_link(url), quote=True)}{quote_char}'
+        return match.group(0)
+
+    # Quoted attributes: href="...", src='...'
+    content = re.sub(r'\b(href|src)=("|\')(.*?)(?:\2)', repl_attr, content, flags=re.IGNORECASE | re.DOTALL)
+
+    # Unquoted attributes: href=... or src=...
+    def repl_unquoted_attr(match: re.Match[str]) -> str:
+        attr, url = match.group(1), match.group(2)
+        if should_rewrite_url(url):
+            return f'{attr}="{html_lib.escape(to_relative_link(url), quote=True)}"'
+        return match.group(0)
+
+    content = re.sub(r'\b(href|src)=([^\s>]+)', repl_unquoted_attr, content, flags=re.IGNORECASE)
+
+    # Plain text URLs that may appear inside scripts or generated markup.
+    def repl_plain(match: re.Match[str]) -> str:
+        return to_relative_link(match.group(0))
+
+    plain_patterns = [
+        r'file:/{2,3}[^\s"\'<>]+?\.html(?:#[^\s"\'<>]*)?',
+        r'/html_artifact\?[^\s"\'<>]*?path=[^\s"\'<>]+',
+        r'/local_file\?[^\s"\'<>]*?path=[^\s"\'<>]+',
+        r'/opt/render/[^\s"\'<>]+?\.html(?:#[^\s"\'<>]*)?',
+        r'[A-Za-z]:/[^\s"\'<>]+?\.html(?:#[^\s"\'<>]*)?',
+    ]
+    for pattern in plain_patterns:
+        content = re.sub(pattern, repl_plain, content)
+    return content
 
 def _run_graph_generation_for_zip(session_csv: Path, sid: str, out_dir: Path) -> tuple[Path | None, str]:
     script = ROOT / "create_graphs.py"
@@ -535,6 +741,7 @@ def _make_results_zip(sid: str) -> Path:
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if session_csv.exists():
             zf.writestr("results.csv", _localized_results_csv_text_for_zip(session_csv, sid, out_dir))
+            zf.writestr("results.html", _results_html_table_for_zip(session_csv, sid, out_dir))
         for html_path in _session_html_files(sid):
             if html_path == zip_path:
                 continue
