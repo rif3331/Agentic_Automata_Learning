@@ -40,7 +40,7 @@ X_GROUP_SIZE = 2
 # 1 = success, 2 = best similarity.
 # The script below automatically creates:
 #   graph 1: success graph, equivalent to Y_AXIS_MODE = 1
-#   graph 2: tool-call delta graph
+#   graph 2: average tool calls graph
 #   graph 3: similarity graph, equivalent to Y_AXIS_MODE = 2
 Y_AXIS_MODE = 1
 
@@ -115,9 +115,8 @@ SUCCESS_GRAPH_TITLE = "Model performance as the number of states in the minimal 
 SUCCESS_Y_LABEL = "Success rate (%) →"
 SIMILARITY_GRAPH_TITLE = "Best hypothesis similarity as the number of states in the minimal DFA increases"
 SIMILARITY_Y_LABEL = "Best hypothesis similarity (%) →"
-TOOL_GRAPH_TITLE = "Δ Tool Calls from TTT"
-TOOL_X_LABEL = "Number of States in the Minimal DFA"
-TOOL_Y_LABEL = "Δ Tool Calls from TTT"
+TOOL_GRAPH_TITLE = "Average tool calls as the number of states in the minimal DFA increases"
+TOOL_Y_LABEL = "Avg Tool calls (← lower is better)"
 X_AXIS_LABEL = "Number of States in the Minimal DFA"
 
 # Colors are assigned by order of first appearance in the CSV.
@@ -136,17 +135,6 @@ BASE_MODEL_COLOR_PALETTE = [
     "cyan",
 ]
 VARIANT_LIGHTEN_STEPS = [0.0, 0.30, 0.50, 0.65, 0.78]
-
-MODEL_COLORS = {
-    "Gemini 3.1 Pro Preview": "tab:orange",
-    "Gemini-3-Flash-Preview (thinking)": "tab:blue",
-    "Gemini-3.1-Flash-Lite-Preview": "tab:green",
-    "GPT-5.4 (without thinking)": "tab:red",
-    "GPT-5.4 (thinking)": "tab:purple",
-    "Deepseek-v4-Pro": "gold",
-    "DeepSeek-V3.2 (thinking)": "brown",
-    "Llama-3.3-70B-Instruct-Turbo": "tab:pink",
-}
 
 # Optional mapping from raw model names to paper names.
 # If your CSV already contains the paper names, this mapping is not required.
@@ -272,26 +260,21 @@ def lighten_color(color, amount):
 
 
 def assign_model_colors(model_labels_in_order):
-    """Assign stable colors to known models and fallback colors to new models."""
+    base_to_color = OrderedDict()
+    base_variant_seen = defaultdict(list)
     label_to_color = {}
-    fallback_index = 0
 
     for label in model_labels_in_order:
-        if label in MODEL_COLORS:
-            label_to_color[label] = MODEL_COLORS[label]
-            continue
+        base = strip_parentheses(label)
+        if base not in base_to_color:
+            base_to_color[base] = BASE_MODEL_COLOR_PALETTE[len(base_to_color) % len(BASE_MODEL_COLOR_PALETTE)]
 
-        while fallback_index < len(BASE_MODEL_COLOR_PALETTE):
-            candidate = BASE_MODEL_COLOR_PALETTE[fallback_index]
-            fallback_index += 1
-            if candidate not in MODEL_COLORS.values():
-                label_to_color[label] = candidate
-                break
-        else:
-            label_to_color[label] = BASE_MODEL_COLOR_PALETTE[
-                fallback_index % len(BASE_MODEL_COLOR_PALETTE)
-            ]
-            fallback_index += 1
+        if label not in base_variant_seen[base]:
+            base_variant_seen[base].append(label)
+
+        variant_index = base_variant_seen[base].index(label)
+        lighten_amount = VARIANT_LIGHTEN_STEPS[min(variant_index, len(VARIANT_LIGHTEN_STEPS) - 1)]
+        label_to_color[label] = lighten_color(base_to_color[base], lighten_amount)
 
     return label_to_color
 
@@ -610,38 +593,20 @@ def aggregate_similarity(df_models):
 
 
 def aggregate_tool_calls(df_models):
-    """Aggregate LLM query delta from TTT, using only successful LLM runs.
+    if MAX_TOOL_CALLS_COLUMN not in df_models.columns:
+        raise ValueError(f"Missing required column for tool graph: {MAX_TOOL_CALLS_COLUMN}")
 
-    For each successful row:
-        delta_ttt = llm_total_queries - TTTStrategy queries
-
-    The graph then shows the delta per model and difficulty level.
-    Delta can be positive when the LLM used more queries than TTT.
-    """
     df_tool = df_models.copy()
-
-    # Keep only successful LLM runs. In this CSV, failed runs are marked with "X".
-    df_tool = df_tool[
-        df_tool[LLM_TOTAL_QUERIES_COLUMN].astype(str).str.strip().str.upper() != "X"
-    ].copy()
-
-    df_tool["llm_queries"] = pd.to_numeric(
-        df_tool[LLM_TOTAL_QUERIES_COLUMN],
-        errors="coerce",
+    df_tool[MAX_TOOL_CALLS_COLUMN] = pd.to_numeric(df_tool[MAX_TOOL_CALLS_COLUMN], errors="coerce")
+    df_tool["tool_calls"] = df_tool.apply(
+        lambda row: parse_llm_total_queries(row[LLM_TOTAL_QUERIES_COLUMN], row[MAX_TOOL_CALLS_COLUMN]),
+        axis=1,
     )
-    df_tool["ttt_queries"] = df_tool[STRATEGIES_COLUMN].apply(
-        lambda v: parse_strategy_queries(v, "TTTStrategy")
-    )
-    df_tool["delta_ttt"] = df_tool["llm_queries"] - df_tool["ttt_queries"]
-
-    df_tool = df_tool.dropna(subset=["delta_ttt"]).copy()
-
-    grouped = (
+    df_tool = df_tool.dropna(subset=["tool_calls"]).copy()
+    return (
         df_tool.groupby(["model_label", "x_group"], as_index=False)
-        .agg(mean_value=("delta_ttt", "mean"), std_value=("delta_ttt", "std"), runs=("delta_ttt", "size"))
+        .agg(mean_value=("tool_calls", "mean"), std_value=("tool_calls", "std"), runs=("tool_calls", "size"))
     )
-    grouped["std_value"] = grouped["std_value"].fillna(0.0).abs()
-    return grouped
 
 
 def aggregate_baselines_from_all_rows(df_all):
@@ -754,219 +719,152 @@ def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_lab
     plt.tight_layout()
     return fig, ax
 
-def draw_tool_calls_graph(agg_tool, model_order, model_colors, x_order, agg_lstar=None, agg_ttt=None):
-    """Draw successful-run tool-call delta from TTT as a simple line graph.
+def draw_tool_calls_graph(agg_tool, model_order, model_colors, x_order, agg_lstar, agg_ttt):
+    y_max = TOOL_Y_MAX
+    if y_max is None:
+        vals = []
+        vals.extend((agg_tool["mean_value"] + agg_tool["std_value"].fillna(0.0)).dropna().tolist())
+        vals.extend((agg_lstar["mean"] + agg_lstar["std"].fillna(0.0)).dropna().tolist())
+        vals.extend((agg_ttt["mean"] + agg_ttt["std"].fillna(0.0)).dropna().tolist())
+        y_max = max(vals) * 1.12 if vals else 100
 
-    X axis: difficulty level / number of states.
-    Y axis: LLM total queries - TTT queries, aggregated across successful runs.
-
-    Only successful LLM runs are included in aggregate_tool_calls().
-    Standard deviation is not shown as a shaded band; it is written below the graph.
-    Positive values mean the LLM used more tool calls than TTT.
-    Negative values mean the LLM used fewer tool calls than TTT.
-    """
     fig, ax = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
-    x_positions = np.arange(len(x_order), dtype=float)
+    x = np.arange(len(x_order), dtype=float)
+    n_models = max(len(model_order), 1)
+    bar_width = min(0.11, BAR_GROUP_WIDTH / n_models)
+    offsets = (np.arange(n_models) - (n_models - 1) / 2) * bar_width
 
-    all_y_values = [0.0]
     hover_artists = []
     artist_to_text = {}
-    std_summary_lines = []
 
-    for model in model_order:
+    for i, model in enumerate(model_order):
         model_df = agg_tool[agg_tool["model_label"] == model]
-        mean_values = []
+        y_values = []
         std_values = []
         runs_values = []
 
         for group in x_order:
             row = model_df[model_df["x_group"] == group]
             if row.empty:
-                mean_values.append(np.nan)
+                y_values.append(np.nan)
                 std_values.append(np.nan)
                 runs_values.append(np.nan)
             else:
-                mean_values.append(float(row.iloc[0]["mean_value"]))
-                std_values.append(abs(float(row.iloc[0]["std_value"] if pd.notna(row.iloc[0]["std_value"]) else 0.0)))
+                y_values.append(float(row.iloc[0]["mean_value"]))
+                std_values.append(float(row.iloc[0]["std_value"] if pd.notna(row.iloc[0]["std_value"]) else 0.0))
                 runs_values.append(float(row.iloc[0]["runs"]))
 
-        y_mean = np.array(mean_values, dtype=float)
-        y_std = np.array(std_values, dtype=float)
-        runs = np.array(runs_values, dtype=float)
-        valid = np.isfinite(y_mean)
-        if not valid.any():
-            continue
-
-        all_y_values.extend(y_mean[valid].tolist())
-
-        std_parts = []
-        for group, std_value in zip(x_order, y_std):
-            if np.isfinite(std_value):
-                std_parts.append(f"{format_x_tick_label(group)}={fmt_num(std_value)}")
-        if std_parts:
-            std_summary_lines.append(f"{model}: " + ", ".join(std_parts))
-
-        color = model_colors.get(model, None)
-
-        line, = ax.plot(
-            x_positions,
-            y_mean,
-            marker="o",
-            linewidth=2.2,
-            markersize=5,
+        xpos = x + offsets[i]
+        bars = ax.bar(
+            xpos,
+            y_values,
+            width=bar_width * 0.92,
             label=model,
-            color=color,
+            color=model_colors[model],
+            edgecolor="black",
+            linewidth=0.55,
+            alpha=0.9,
             zorder=3,
         )
-        hover_artists.append(line)
 
-        def make_hover_text(model_name=model, mean_arr=y_mean, std_arr=y_std, runs_arr=runs):
-            def hover_text(event):
-                if event.xdata is None:
-                    return None
-                idx = int(round(event.xdata))
-                if idx < 0 or idx >= len(x_order) or not np.isfinite(mean_arr[idx]):
-                    return None
-                return (
-                    f"{model_name}\n"
-                    f"states={format_x_tick_label(x_order[idx])}\n"
-                    f"LLM - TTT tool calls={fmt_num(mean_arr[idx])}\n"
-                    f"std={fmt_num(std_arr[idx])}\n"
-                    f"successful runs={fmt_num(runs_arr[idx], 0)}"
-                )
-            return hover_text
-
-        artist_to_text[line] = make_hover_text()
-
-    # TTT reference is exactly zero because the metric is:
-    #     Δ Tool Calls from TTT = model queries - TTT queries
-    ttt_reference_line = ax.axhline(
-        0.0,
-        color="gray",
-        linestyle=(0, (3, 3)),
-        linewidth=1.4,
-        label="TTT reference",
-        zorder=2,
-    )
-    hover_artists.append(ttt_reference_line)
-    artist_to_text[ttt_reference_line] = "TTT reference\nΔ Tool Calls from TTT=0"
-
-    # L* reference in the same units as the model curves:
-    #     Δ Tool Calls from TTT = L* queries - TTT queries
-    lstar_reference_line = None
-    if agg_lstar is not None and agg_ttt is not None:
-        lstar_reference_values = []
-        for group in x_order:
-            lstar_row = agg_lstar[agg_lstar["x_group"] == group]
-            ttt_row = agg_ttt[agg_ttt["x_group"] == group]
-            if lstar_row.empty or ttt_row.empty:
-                lstar_reference_values.append(np.nan)
-            else:
-                lstar_reference_values.append(
-                    float(lstar_row.iloc[0]["mean"]) - float(ttt_row.iloc[0]["mean"])
-                )
-
-        lstar_reference_values = np.array(lstar_reference_values, dtype=float)
-        valid_ref = np.isfinite(lstar_reference_values)
-        if valid_ref.any():
-            all_y_values.extend(lstar_reference_values[valid_ref].tolist())
-            lstar_reference_line, = ax.plot(
-                x_positions,
-                lstar_reference_values,
-                color="black",
-                linestyle=(0, (3, 3)),
-                linewidth=1.4,
-                label="L* reference",
-                zorder=2,
+        for group, bar, yi, si, runs in zip(x_order, bars, y_values, std_values, runs_values):
+            if not np.isfinite(yi):
+                continue
+            hover_artists.append(bar)
+            artist_to_text[bar] = (
+                f"{model}\n"
+                f"states={format_x_tick_label(group)}\n"
+                f"avg tool calls={fmt_num(yi)}\n"
+                f"std={fmt_num(si)}\n"
+                f"runs={fmt_num(runs, 0)}"
             )
 
-            hover_artists.append(lstar_reference_line)
-
-            def lstar_hover_text(event):
-                if event.xdata is None:
-                    return None
-                idx = int(round(event.xdata))
-                if idx < 0 or idx >= len(x_order) or not np.isfinite(lstar_reference_values[idx]):
-                    return None
-                return (
-                    "L* reference\n"
-                    f"states={format_x_tick_label(x_order[idx])}\n"
-                    f"L* - TTT tool calls={fmt_num(lstar_reference_values[idx])}"
+        # The tool-call graph shows variance/std bars when enabled.
+        if SHOW_ERROR_BARS and SHOW_TOOL_ERROR_BARS:
+            for xi, yi, si in zip(xpos, y_values, std_values):
+                if not np.isfinite(yi) or not np.isfinite(si):
+                    continue
+                lower = min(si, yi)
+                upper = min(si, max(0.0, y_max - yi))
+                ax.errorbar(
+                    xi,
+                    yi,
+                    yerr=np.array([[lower], [upper]]),
+                    fmt="none",
+                    ecolor="black",
+                    elinewidth=1.0,
+                    capsize=3,
+                    capthick=1.0,
+                    zorder=4,
                 )
 
-            artist_to_text[lstar_reference_line] = lstar_hover_text
+    x_centers = {group: idx for idx, group in enumerate(x_order)}
 
-    y_min = min(all_y_values)
-    y_max = max(all_y_values)
-    pad = max(1.0, (y_max - y_min) * 0.12)
-    ax.set_ylim(y_min - pad, y_max + pad)
+    def draw_baseline(agg_base, label, color):
+        for _, row in agg_base.iterrows():
+            group = row["x_group"]
+            if group not in x_centers:
+                continue
+            center = x_centers[group]
+            y = float(row["mean"])
+            std = float(row["std"] if pd.notna(row["std"]) else 0.0)
+            runs = float(row["runs"] if pd.notna(row["runs"]) else 0.0)
+            line = ax.plot(
+                [center - BAR_GROUP_WIDTH / 2, center + BAR_GROUP_WIDTH / 2],
+                [y, y],
+                color=color,
+                linestyle=(0, (3, 3)),
+                linewidth=1.7,
+                zorder=5,
+            )[0]
+            hover_artists.append(line)
+            artist_to_text[line] = (
+                f"{label}\n"
+                f"states={format_x_tick_label(group)}\n"
+                f"avg tool calls={fmt_num(y)}\n"
+                f"std={fmt_num(std)}\n"
+                f"runs={fmt_num(runs, 0)}"
+            )
+
+            if SHOW_BASELINE_ERROR_BARS:
+                ax.errorbar(
+                    center - BAR_GROUP_WIDTH / 2 + 0.06,
+                    y,
+                    yerr=np.array([[min(std, y)], [min(std, max(0.0, y_max - y))]]),
+                    fmt="none",
+                    ecolor="black",
+                    elinewidth=1.0,
+                    capsize=3,
+                    capthick=1.0,
+                    zorder=6,
+                )
+
+    draw_baseline(agg_ttt, TTT_LABEL, "black")
+    draw_baseline(agg_lstar, LSTAR_LABEL, "0.45")
 
     ax.set_title(TOOL_GRAPH_TITLE, fontsize=14, fontweight="bold")
-    ax.set_xlabel(TOOL_X_LABEL, fontsize=12)
+    ax.set_xlabel(X_AXIS_LABEL, fontsize=12)
     ax.set_ylabel(TOOL_Y_LABEL, fontsize=12)
-    ax.set_xticks(x_positions)
+    ax.set_xticks(x)
     ax.set_xticklabels([format_x_tick_label(g) for g in x_order])
+    ax.set_ylim(0, y_max)
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
 
-    if std_summary_lines:
-        std_text = "Std. of Δ Tool Calls from TTT: " + " | ".join(std_summary_lines)
-        fig.text(
-            0.5,
-            0.015,
-            std_text,
-            ha="center",
-            va="bottom",
-            fontsize=7,
-            wrap=True,
-        )
+    handles, labels = ax.get_legend_handles_labels()
+    handles.extend([
+        Line2D([0], [0], color="black", linestyle=(0, (3, 3)), linewidth=1.7, label=TTT_LABEL),
+        Line2D([0], [0], color="0.45", linestyle=(0, (3, 3)), linewidth=1.7, label=LSTAR_LABEL),
+    ])
+    labels.extend([TTT_LABEL, LSTAR_LABEL])
 
     if SHOW_LEGENDS:
-        model_handles, model_labels = ax.get_legend_handles_labels()
-
-        # Keep model legend above the graph.
-        reference_labels = {"L* reference", "TTT reference"}
-        filtered_models = [
-            (handle, label)
-            for handle, label in zip(model_handles, model_labels)
-            if label not in reference_labels
-        ]
-
-        if filtered_models:
-            model_handles_only, model_labels_only = zip(*filtered_models)
-            main_legend = ax.legend(
-                model_handles_only,
-                model_labels_only,
-                loc="upper center",
-                bbox_to_anchor=(0.5, 1.22),
-                ncol=3,
-                fontsize=8,
-                frameon=True,
-            )
-            ax.add_artist(main_legend)
-
-        # Small reference legend inside the graph.
-        reference_handles = []
-        reference_legend_labels = []
-        if lstar_reference_line is not None:
-            reference_handles.append(lstar_reference_line)
-            reference_legend_labels.append("L* reference")
-        reference_handles.append(ttt_reference_line)
-        reference_legend_labels.append("TTT reference")
-
-        ax.legend(
-            reference_handles,
-            reference_legend_labels,
-            loc="best",
-            fontsize=8,
-            frameon=True,
-            borderpad=0.35,
-            handlelength=2.0,
-        )
+        ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.22), ncol=3, fontsize=8, frameon=True)
 
     add_hover_cursor(hover_artists, artist_to_text)
-    plt.tight_layout(rect=(0, 0.08, 1, 1))
+    plt.tight_layout()
     return fig, ax
+
 
 def draw_similarity_line_graph(agg_similarity, model_order, model_colors, x_order):
     """Draw similarity like the appendix figure: lines + shaded one-std region."""

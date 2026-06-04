@@ -13,6 +13,7 @@ import threading
 import uuid
 import contextvars
 import zipfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -412,22 +413,139 @@ def _session_html_files(sid: str) -> list[Path]:
     return sorted([p for p in out_dir.rglob("*.html") if p.is_file()])
 
 
+def _zip_relative_path_for_session_file(path: Path, out_dir: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(out_dir)).replace("\\", "/")
+    except Exception:
+        return path.name
+
+
+def _localize_path_for_results_zip(value: str, sid: str, out_dir: Path) -> str:
+    """Convert server/local artifact URLs in downloaded results to paths inside the ZIP.
+
+    The app itself still uses Render URLs while running. Only the downloaded ZIP
+    copy is rewritten so result rows point to files that exist inside the ZIP,
+    e.g. html/session_...html instead of file:////opt/render/.../html/session_...html.
+    """
+    if not value:
+        return value
+
+    text = str(value)
+
+    def decode_html_artifact(match: re.Match[str]) -> str:
+        raw = unquote(match.group(1))
+        return _localize_path_for_results_zip(raw, sid, out_dir)
+
+    text = re.sub(r'/html_artifact\?[^\s,;"\'<>]*?path=([^&\s,;"\'<>]+)[^\s,;"\'<>]*', decode_html_artifact, text)
+
+    prefixes = []
+    out_posix = out_dir.as_posix()
+    out_str = str(out_dir)
+    prefixes.extend([
+        out_posix + "/",
+        out_str + os.sep,
+        "file:///" + out_posix.lstrip("/") + "/",
+        "file://" + out_posix + "/",
+        "file:///" + out_str.replace("\\", "/").lstrip("/") + "/",
+    ])
+
+    session_fragment = f"runs/sessions/{sid}/"
+    generic_session_fragment = r"runs[/\\]sessions[/\\][^/\\]+[/\\]"
+    for prefix in prefixes:
+        text = text.replace(prefix, "")
+
+    # Fallback for Render/Linux absolute paths, Windows paths, or any file URL
+    # containing a session output directory. Keep only the path inside it.
+    text = re.sub(rf'file:/*[^\s,;"\'<>]*?{re.escape(session_fragment)}', '', text)
+    text = re.sub(rf'file:/*[^\s,;"\'<>]*?{generic_session_fragment}', '', text)
+    text = re.sub(rf'[A-Za-z]:[/\\][^\s,;"\'<>]*?{generic_session_fragment}', '', text)
+    text = re.sub(rf'/[^\s,;"\'<>]*?{re.escape(session_fragment)}', '', text)
+    text = re.sub(rf'/[^\s,;"\'<>]*?{generic_session_fragment}', '', text)
+
+    text = re.sub(r"file:/*(?=(html|DFA|L_star_comparisons|session_|graphs\.pdf))", "", text)
+    return text.replace("\\", "/")
+
+
+def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Path) -> str:
+    if not session_csv.exists():
+        return ""
+    raw = session_csv.read_text(encoding="utf-8-sig", errors="replace")
+    try:
+        rows = list(csv.DictReader(raw.splitlines()))
+        fieldnames = csv.DictReader(raw.splitlines()).fieldnames
+        if not fieldnames:
+            return raw
+        import io
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: _localize_path_for_results_zip(str(row.get(k, "")), sid, out_dir) for k in fieldnames})
+        return buf.getvalue()
+    except Exception:
+        return _localize_path_for_results_zip(raw, sid, out_dir)
+
+
+def _localized_html_content_for_zip(path: Path, sid: str, out_dir: Path) -> str:
+    content = path.read_text(encoding="utf-8", errors="replace")
+    return _localize_path_for_results_zip(content, sid, out_dir)
+
+
+def _run_graph_generation_for_zip(session_csv: Path, sid: str, out_dir: Path) -> tuple[Path | None, str]:
+    script = ROOT / "create_graphs.py"
+    if not script.exists():
+        return None, "create_graphs.py was not found in the project root, so graphs were not generated."
+    if not session_csv.exists():
+        return None, "results.csv was not found, so graphs were not generated."
+
+    localized_csv = out_dir / "results_for_graphs.csv"
+    graphs_pdf = out_dir / "graphs.pdf"
+    try:
+        localized_csv.write_text(_localized_results_csv_text_for_zip(session_csv, sid, out_dir), encoding="utf-8", newline="")
+        env = os.environ.copy()
+        env.setdefault("MPLBACKEND", "Agg")
+        proc = subprocess.run(
+            [sys.executable, str(script), str(localized_csv), "--output-pdf", str(graphs_pdf)],
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+            env=env,
+            check=False,
+        )
+        log = proc.stdout or ""
+        if proc.returncode == 0 and graphs_pdf.exists():
+            return graphs_pdf, log or "Graphs generated successfully."
+        return None, log or f"create_graphs.py exited with code {proc.returncode}."
+    except Exception as exc:
+        return None, f"Graph generation failed: {type(exc).__name__}: {exc}"
+
+
 def _make_results_zip(sid: str) -> Path:
     state = _state(sid)
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"session_results_{sid}.zip"
     session_csv = _csv_path_for_session(sid)
+    graph_pdf, graph_log = _run_graph_generation_for_zip(session_csv, sid, out_dir)
+
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if session_csv.exists():
-            zf.write(session_csv, arcname="results.csv")
+            zf.writestr("results.csv", _localized_results_csv_text_for_zip(session_csv, sid, out_dir))
         for html_path in _session_html_files(sid):
             if html_path == zip_path:
                 continue
+            arcname = _zip_relative_path_for_session_file(html_path, out_dir)
             try:
-                zf.write(html_path, arcname=str(Path("html") / html_path.relative_to(out_dir)))
+                zf.writestr(arcname, _localized_html_content_for_zip(html_path, sid, out_dir))
             except Exception:
-                zf.write(html_path, arcname=str(Path("html") / html_path.name))
+                zf.write(html_path, arcname=arcname)
+        if graph_pdf and graph_pdf.exists():
+            zf.write(graph_pdf, arcname="graphs.pdf")
+        zf.writestr("graph_generation_log.txt", graph_log or "")
         log_path = out_dir / "launcher_logs.txt"
         log_path.write_text("\n".join(state.get("logs", [])), encoding="utf-8")
         zf.write(log_path, arcname="launcher_logs.txt")
@@ -1552,6 +1670,7 @@ let analysisMode = false;
 let lastRenderedEventsKey = "";
 let renderLocked = false;
 let lockedFrameSrcByCall = {};
+let renderedEventKeys = [];
 
 function escapeHtml(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function isFlashLiteSelected(){
@@ -1654,32 +1773,10 @@ function showMode(data){
   const shouldShowOutput = data.running || ended || hasEvents || analysisMode;
   if(outputCard){ outputCard.classList.toggle('hidden', !shouldShowOutput || forceForm); }
 }
-function renderEvents(events, isRunning, result, budgetExhausted){
-  const host=document.getElementById('chat');
-  const full=document.getElementById('full-analysis');
-  const shouldStick = autoScroll && nearBottom(host);
-  const isTerminal = (result === 'won' || result === 'lost' || result === 'crashed' || result === 'stopped');
-
-  if(analysisMode){
-    host.classList.add('hidden');
-    full.classList.remove('hidden');
-    return;
-  }
-
-  // Always restore the chat/report visibility before applying the terminal
-  // render lock. Otherwise, clicking "Back to run display" after opening
-  // the full analysis can leave the analysis iframe visible forever.
-  full.classList.add('hidden');
-  host.classList.remove('hidden');
-
-  if((budgetExhausted || isTerminal) && renderLocked && !analysisMode){
-    return;
-  }
-
-  let html = '';
-  const hasInitialPrompt = !!(events && events.some(ev => ev.type === 'init_prompt'));
-  if(events && events.length){
-    html = events.map(ev=>{
+function eventRenderKey(ev){
+  return `${ev.type || ''}:${ev.call || ''}:${ev.iframe || ''}`;
+}
+function renderSingleEvent(ev){
       const cls = ev.oracle_class || 'oracle-normal';
       const callBadge = ev.call_label ? `<span class="call-badge">${escapeHtml(ev.call_label)}</span>` : '';
 
@@ -1796,43 +1893,77 @@ function renderEvents(events, isRunning, result, budgetExhausted){
           <div class="msg oracle ${cls}"><div class="bubble-line"><span class="emoji">🔮</span><span>${escapeHtml(ev.oracle)}</span></div></div>
         </div>
       </div>`;
-    }).join('');
+
+}
+function renderEvents(events, isRunning, result, budgetExhausted){
+  const host=document.getElementById('chat');
+  const full=document.getElementById('full-analysis');
+  const shouldStick = autoScroll && nearBottom(host);
+  const isTerminal = (result === 'won' || result === 'lost' || result === 'crashed' || result === 'stopped');
+
+  if(analysisMode){
+    host.classList.add('hidden');
+    full.classList.remove('hidden');
+    return;
   }
+
+  full.classList.add('hidden');
+  host.classList.remove('hidden');
+
+  if((budgetExhausted || isTerminal) && renderLocked && !analysisMode){
+    return;
+  }
+
+  events = events || [];
+  const hasInitialPrompt = !!(events && events.some(ev => ev.type === 'init_prompt'));
+  let parts = events.map(ev => renderSingleEvent(ev));
+
   if(isRunning && hasInitialPrompt && !budgetExhausted && !isTerminal){
-    html += `<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`;
+    parts.push(`<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
   }
-  const eventsKey = JSON.stringify({
-    events: (events || []).map(ev => ({
-      type: ev.type || '',
-      call: ev.call || '',
-      agent: ev.agent || '',
-      oracle: ev.oracle || '',
-      oracle_class: ev.oracle_class || '',
-      iframe: ev.iframe || '',
-      analysis: ev.analysis || {},
-      passive: ev.passive || {},
-      similarity: ev.similarity || {}
-    })),
+
+  const currentKeys = events.map(ev => eventRenderKey(ev));
+  let canAppendOnly = renderedEventKeys.length <= currentKeys.length;
+  for(let i=0; i<renderedEventKeys.length && canAppendOnly; i++){
+    if(renderedEventKeys[i] !== currentKeys[i]) canAppendOnly = false;
+  }
+
+  const lastEvent = events && events.length ? events[events.length - 1] : null;
+  const shouldForceBottom = !!(lastEvent && lastEvent.type === 'eq' && lastEvent.oracle_class === 'oracle-success');
+
+  if(canAppendOnly){
+    const typing = host.querySelector('[data-live-typing="1"]');
+    if(typing) typing.remove();
+
+    for(let i=renderedEventKeys.length; i<currentKeys.length; i++){
+      host.insertAdjacentHTML('beforeend', parts[i] || '');
+    }
+
+    if(isRunning && hasInitialPrompt && !budgetExhausted && !isTerminal){
+      host.insertAdjacentHTML('beforeend', `<div class="turn" data-live-typing="1"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
+    }
+
+    renderedEventKeys = currentKeys.slice();
+    centerAllDfaFrames();
+  } else {
+    host.innerHTML = parts.join('');
+    renderedEventKeys = currentKeys.slice();
+    centerAllDfaFrames();
+  }
+
+  lastRenderedEventsKey = JSON.stringify({
+    events: events || [],
     isRunning: isRunning,
     result: result || '',
     budgetExhausted: !!budgetExhausted
   });
 
-  if (eventsKey !== lastRenderedEventsKey) {
-    host.innerHTML = html || '';
-    lastRenderedEventsKey = eventsKey;
-    centerAllDfaFrames();
+  if (shouldStick || shouldForceBottom) {
+    host.scrollTop = host.scrollHeight;
+  }
 
-    const lastEvent = events && events.length ? events[events.length - 1] : null;
-    const shouldForceBottom = !!(lastEvent && lastEvent.type === 'eq' && lastEvent.oracle_class === 'oracle-success');
-
-    if (shouldStick || shouldForceBottom) {
-      host.scrollTop = host.scrollHeight;
-    }
-
-    if (budgetExhausted || isTerminal) {
-      renderLocked = true;
-    }
+  if (budgetExhausted || isTerminal) {
+    renderLocked = true;
   }
 }
 
@@ -1915,6 +2046,7 @@ function resetToStartScreenKeepKey(){
   lastRenderedEventsKey='';
   renderLocked=false;
   lockedFrameSrcByCall={};
+  renderedEventKeys=[];
 
   window.history.replaceState({},'', '/?new=1');
 
@@ -1957,6 +2089,7 @@ function newGame(){
   lastRenderedEventsKey='';
   renderLocked=false;
   lockedFrameSrcByCall={};
+  renderedEventKeys=[];
   window.history.replaceState({},'', '/?new=1');
   const chat=document.getElementById('chat');
   const full=document.getElementById('full-analysis');
