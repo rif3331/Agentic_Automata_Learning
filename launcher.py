@@ -12,6 +12,7 @@ import subprocess
 import signal
 import sys
 import threading
+import time
 import uuid
 import contextvars
 import zipfile
@@ -84,7 +85,12 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "auto_key_used": False,
         "finalized_once": False,
         "drive_links": {},
+        "drive_file_ids": {},
         "drive_uploaded_once": False,
+        "drive_run_folder_id": "",
+        "drive_run_folder_link": "",
+        "run_started_at_epoch": 0.0,
+        "download_sheets_synced_once": False,
     }
 
 
@@ -298,72 +304,83 @@ def _append_rows_to_csv(path: Path, fieldnames: list[str], rows: list[dict[str, 
 
 
 def _append_rows_to_google_sheet(sheet_name: str, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
-    """Append rows to Google Sheets when GOOGLE_SHEET_ID and credentials are configured."""
+    """Append rows to Google Sheets when GOOGLE_SHEET_ID and credentials are configured.
+
+    Render env vars supported:
+      GOOGLE_SHEET_ID
+      GOOGLE_SHEETS_CREDENTIALS_JSON  (service account JSON as one line)
+      GOOGLE_APPLICATION_CREDENTIALS  (path to service account JSON file)
+    """
     if not fieldnames or not rows:
         return
     spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip()
     if not spreadsheet_id:
-        _append_log("Google Sheets append skipped: GOOGLE_SHEET_ID is not configured.")
-        return
-    info = _google_service_account_info()
-    if not info:
-        _append_log("Google Sheets append skipped: service-account credentials are not configured.")
         return
     try:
         import gspread
         from google.oauth2 import service_account
 
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-        gc = gspread.authorize(creds)
+        info = _google_service_account_info()
+        if info:
+            scopes = [
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ]
+            creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+            gc = gspread.authorize(creds)
+        else:
+            gc = gspread.service_account()
+
         sh = gc.open_by_key(spreadsheet_id)
         try:
             ws = sh.worksheet(sheet_name)
         except Exception:
             ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=max(20, len(fieldnames)))
-            ws.append_row(fieldnames, value_input_option="USER_ENTERED")
+            ws.append_row(fieldnames, value_input_option="RAW")
 
         existing_header = ws.row_values(1)
         if not existing_header:
-            ws.append_row(fieldnames, value_input_option="USER_ENTERED")
-            existing_header = list(fieldnames)
+            ws.append_row(fieldnames, value_input_option="RAW")
         elif existing_header != fieldnames:
+            # Preserve old columns and append any new columns at the end.
             merged = list(existing_header)
             for name in fieldnames:
                 if name not in merged:
                     merged.append(name)
             if merged != existing_header:
-                ws.update("1:1", [merged], value_input_option="USER_ENTERED")
+                ws.update("1:1", [merged])
             fieldnames = merged
 
         values = [[str(row.get(col, "")) for col in fieldnames] for row in rows]
-        if values:
-            ws.append_rows(values, value_input_option="USER_ENTERED")
-            _append_log(f"Google Sheets append complete ({sheet_name}): {len(values)} row(s).")
+        ws.append_rows(values, value_input_option="RAW")
     except Exception as exc:
         _append_log(f"Google Sheets append failed ({sheet_name}): {type(exc).__name__}: {exc}")
 
 
+
+
 def _google_service_account_info() -> dict[str, Any] | None:
-    json_env_names = (
-        "GOOGLE_SHEETS_CREDENTIALS_JSON",
+    """Read service-account credentials from Render environment variables.
+
+    Supported names:
+      GOOGLE_SHEETS_CREDENTIALS
+      GOOGLE_SHEETS_CREDENTIALS_JSON
+      GOOGLE_CREDENTIALS_JSON
+      GOOGLE_APPLICATION_CREDENTIALS
+    """
+    for env_name in (
         "GOOGLE_SHEETS_CREDENTIALS",
-        "GOOGLE_SERVICE_ACCOUNT_JSON",
+        "GOOGLE_SHEETS_CREDENTIALS_JSON",
         "GOOGLE_CREDENTIALS_JSON",
-    )
-    for env_name in json_env_names:
+    ):
         creds_json = os.environ.get(env_name, "").strip()
         if not creds_json:
             continue
         try:
             info = json.loads(creds_json)
-            private_key = str(info.get("private_key", ""))
-            if "\\n" in private_key:
-                info["private_key"] = private_key.replace("\\n", "\n")
-            return info
+            if isinstance(info, dict) and info.get("client_email"):
+                return info
+            _append_log(f"Google credentials in {env_name} did not look like a service-account JSON.")
         except Exception as exc:
             _append_log(f"Google credentials JSON parse failed from {env_name}: {type(exc).__name__}: {exc}")
             return None
@@ -371,17 +388,12 @@ def _google_service_account_info() -> dict[str, Any] | None:
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if creds_path:
         try:
-            info = json.loads(Path(creds_path).read_text(encoding="utf-8"))
-            private_key = str(info.get("private_key", ""))
-            if "\\n" in private_key:
-                info["private_key"] = private_key.replace("\\n", "\n")
-            return info
+            return json.loads(Path(creds_path).read_text(encoding="utf-8"))
         except Exception as exc:
             _append_log(f"Google credentials file read failed: {type(exc).__name__}: {exc}")
             return None
 
     return None
-
 
 def _google_drive_service():
     """Return a Google Drive service client, or None when Drive is not configured."""
@@ -391,7 +403,7 @@ def _google_drive_service():
 
     info = _google_service_account_info()
     if not info:
-        _append_log("Google Drive upload skipped: service-account credentials are not configured.")
+        _append_log("Google Drive upload skipped: Google service-account credentials are not configured.")
         return None
 
     try:
@@ -456,7 +468,7 @@ def _ensure_drive_run_folder(service, sid: str) -> str:
 
 
 def _upload_file_to_google_drive(path: Path, sid: str, out_dir: Path, service=None) -> tuple[str, str]:
-    """Upload one artifact to Drive and return (browser_link, file_id)."""
+    """Upload/update one artifact to Drive and return (browser_link, file_id)."""
     parent_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     if not parent_folder_id or not path.exists() or not path.is_file():
         return "", ""
@@ -470,19 +482,44 @@ def _upload_file_to_google_drive(path: Path, sid: str, out_dir: Path, service=No
 
         run_folder_id = _ensure_drive_run_folder(service, sid) or parent_folder_id
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        filename = _drive_safe_name(path, out_dir, sid)
         media = MediaFileUpload(str(path), mimetype=mime_type, resumable=False)
-        metadata = {
-            "name": _drive_safe_name(path, out_dir, sid),
-            "parents": [run_folder_id],
-            "mimeType": mime_type,
-        }
-        created = service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id,webViewLink,webContentLink",
-            supportsAllDrives=True,
-        ).execute()
-        file_id = created.get("id", "")
+
+        file_id = ""
+        try:
+            escaped_name = filename.replace("'", "\\'")
+            query = f"name = '{escaped_name}' and '{run_folder_id}' in parents and trashed = false"
+            found = service.files().list(
+                q=query,
+                spaces="drive",
+                fields="files(id,webViewLink)",
+                pageSize=1,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute().get("files", [])
+            if found:
+                file_id = found[0].get("id", "")
+        except Exception:
+            file_id = ""
+
+        if file_id:
+            created = service.files().update(
+                fileId=file_id,
+                media_body=media,
+                body={"mimeType": mime_type, "name": filename},
+                fields="id,webViewLink,webContentLink",
+                supportsAllDrives=True,
+            ).execute()
+        else:
+            metadata = {"name": filename, "parents": [run_folder_id], "mimeType": mime_type}
+            created = service.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id,webViewLink,webContentLink",
+                supportsAllDrives=True,
+            ).execute()
+            file_id = created.get("id", "")
+
         if not file_id:
             return "", ""
 
@@ -502,7 +539,6 @@ def _upload_file_to_google_drive(path: Path, sid: str, out_dir: Path, service=No
     except Exception as exc:
         _append_log(f"Google Drive upload failed for {path}: {type(exc).__name__}: {exc}")
         return "", ""
-
 
 def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path]:
     """Collect HTML artifacts from the session output tree plus explicit log/CSV references."""
@@ -541,6 +577,10 @@ def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path
             ref = _extract_first_html_reference(str(value or ""))
             if ref:
                 add_ref(ref)
+
+    for p in _recent_html_files_from_runs(sid):
+        if p.exists() and p.is_file():
+            files.add(p.resolve())
 
     return sorted(files)
 
@@ -649,6 +689,7 @@ def _ensure_drive_artifacts_uploaded(sid: str, *, force: bool = False) -> dict[s
 
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
     html_files = _all_session_html_files_and_references(sid, out_dir)
+    _append_log(f"Google Drive upload scan found {len(html_files)} HTML artifact(s).")
 
     uploaded = 0
     for path in html_files:
@@ -837,6 +878,25 @@ def _session_html_files(sid: str) -> list[Path]:
     if not out_dir.exists():
         return []
     return sorted([p for p in out_dir.rglob("*.html") if p.is_file()])
+
+
+def _recent_html_files_from_runs(sid: str) -> list[Path]:
+    """Fallback collector for artifacts written outside the per-session output dir."""
+    state = _state(sid)
+    start_epoch = float(state.get("run_started_at_epoch") or 0.0)
+    cutoff = max(0.0, start_epoch - 300.0)
+    roots = [ROOT / "runs"]
+    files: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*.html"):
+            try:
+                if p.is_file() and (not cutoff or p.stat().st_mtime >= cutoff):
+                    files.append(p.resolve())
+            except Exception:
+                continue
+    return sorted(set(files))
 
 
 def _zip_relative_path_for_session_file(path: Path, out_dir: Path) -> str:
@@ -1327,6 +1387,53 @@ def _run_graph_generation_for_zip(session_csv: Path, sid: str, out_dir: Path) ->
         return None, f"Graph generation failed: {type(exc).__name__}: {exc}"
 
 
+def _sync_download_rows_to_google_sheets(sid: str) -> None:
+    """After user clicks download, append rows with Drive links to Google Sheets once."""
+    state = _state(sid)
+    if state.get("download_sheets_synced_once"):
+        return
+
+    session_csv = _csv_path_for_session(sid)
+    out_dir = (ROOT / _session_output_dir(sid)).resolve()
+    drive_links = dict(state.get("drive_links") or {})
+    if drive_links:
+        _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+
+    fieldnames, rows = _read_csv_rows(session_csv)
+    if not fieldnames or not rows:
+        return
+
+    enriched_fields = list(fieldnames)
+    for col in [
+        "launcher_session_id",
+        "launcher_result",
+        "launcher_downloaded_at_utc",
+        "launcher_drive_folder_id",
+        "launcher_drive_folder_link",
+    ]:
+        if col not in enriched_fields:
+            enriched_fields.append(col)
+
+    downloaded_at = datetime.now(timezone.utc).isoformat()
+    enriched_rows: list[dict[str, Any]] = []
+    for row in rows:
+        out = _replace_html_references_with_drive_links(dict(row), sid, out_dir, drive_links)
+        out.update({
+            "launcher_session_id": sid,
+            "launcher_result": _run_result(),
+            "launcher_downloaded_at_utc": downloaded_at,
+            "launcher_drive_folder_id": str(state.get("drive_run_folder_id") or os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")).strip(),
+            "launcher_drive_folder_link": str(state.get("drive_run_folder_link") or "").strip(),
+        })
+        if out.get("launcher_drive_html_links") and "launcher_drive_html_links" not in enriched_fields:
+            enriched_fields.append("launcher_drive_html_links")
+        enriched_rows.append(out)
+
+    _append_rows_to_google_sheet("results", enriched_fields, enriched_rows)
+    _append_rows_to_google_sheet("all_users_results", enriched_fields, enriched_rows)
+    state["download_sheets_synced_once"] = True
+
+
 def _make_results_zip(sid: str) -> Path:
     """Create a user download ZIP.
 
@@ -1344,9 +1451,10 @@ def _make_results_zip(sid: str) -> Path:
 
     # Re-run upload/link rewrite before download. This makes the button robust
     # even if the run ended before Drive was configured or finalize had failed.
-    drive_links = _ensure_drive_artifacts_uploaded(sid, force=not bool(_state(sid).get("drive_links")))
+    drive_links = _ensure_drive_artifacts_uploaded(sid, force=True)
     if drive_links:
         _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+    _sync_download_rows_to_google_sheets(sid)
 
     graph_pdf, graph_log = _run_graph_generation_for_zip(session_csv, sid, out_dir)
 
@@ -1609,6 +1717,7 @@ def _run_command(cmd: list[str], sid: str) -> None:
     if not state["logs"]:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
     state["current_full_report_path"] = ""
+    state["run_started_at_epoch"] = time.time()
     _append_log("Launcher started.")
 
     safe_cmd = []
