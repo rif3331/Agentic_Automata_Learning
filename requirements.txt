@@ -16,3 +16,5 @@ langchain-openai
 langchain-google-genai
 langchain-anthropic
 google-genai
+gspread
+google-auth

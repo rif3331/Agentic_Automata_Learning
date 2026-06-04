@@ -12,12 +12,13 @@ import sys
 import threading
 import uuid
 import contextvars
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
 from typing import Any, Iterable, Iterator
 
-from flask import Flask, request, render_template_string, Response, jsonify, redirect, url_for, send_from_directory, session
+from flask import Flask, request, render_template_string, Response, jsonify, redirect, url_for, send_from_directory, session, send_file
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key-for-production")
@@ -26,8 +27,9 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS_CSV = ROOT / "runs" / "results.csv"
 FALLBACK_RESULTS_CSV = ROOT / "results.csv"
 GLOBAL_RESULTS_CSV = ROOT / "runs" / "all_users_results.csv"
-AUTO_KEY_RUN_COSTS_CSV = ROOT / "runs" / "auto_key_run_costs.csv"
 AUTO_KEY_DAILY_COSTS_CSV = ROOT / "runs" / "auto_key_daily_costs.csv"
+FLASH_LITE_MODEL = "gemini-3.1-flash-lite-preview"
+
 
 DEFAULT_LAST_FORM: dict[str, str] = {
     "api_provider": "google",
@@ -75,9 +77,8 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "current_full_report_path": "",
         "last_form": form,
         "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
-        "synced_result_rows": 0,
-        "current_run_id": "",
-        "auto_api_key_used": False,
+        "auto_key_used": False,
+        "finalized_once": False,
     }
 
 
@@ -86,10 +87,6 @@ def _state(sid: str | None = None) -> dict[str, Any]:
     with sessions_lock:
         if sid not in sessions:
             sessions[sid] = _new_session_state(sid)
-            try:
-                sessions[sid]["synced_result_rows"] = _count_csv_rows(_session_results_csv_path(sid))
-            except Exception:
-                sessions[sid]["synced_result_rows"] = 0
         return sessions[sid]
 
 
@@ -251,6 +248,190 @@ def _append_log(line: str) -> None:
     logs.append(line)
     if len(logs) > 25000:
         del logs[:5000]
+
+
+def _normalize_model_name(model_name: str) -> str:
+    return re.sub(r"\s*\([^)]*\)\s*$", "", (model_name or "").strip())
+
+
+def _is_flash_lite_model(provider: str, model_name: str) -> bool:
+    return (provider or "").strip().lower() == "google" and _normalize_model_name(model_name) == FLASH_LITE_MODEL
+
+
+def _csv_path_for_session(sid: str) -> Path:
+    form = _state(sid)["last_form"]
+    output_dir = ROOT / form.get("output_dir", _session_output_dir(sid))
+    csv_name = form.get("experiment_csv", "results.csv") or "results.csv"
+    return output_dir / csv_name
+
+
+def _read_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    if not path.exists() or not path.is_file():
+        return [], []
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return [], []
+            return list(reader.fieldnames), list(reader)
+    except Exception:
+        return [], []
+
+
+def _append_rows_to_csv(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    if not fieldnames or not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists() and path.stat().st_size > 0
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _append_rows_to_google_sheet(sheet_name: str, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
+    """Append rows to Google Sheets when GOOGLE_SHEET_ID and credentials are configured.
+
+    Render env vars supported:
+      GOOGLE_SHEET_ID
+      GOOGLE_SHEETS_CREDENTIALS_JSON  (service account JSON as one line)
+      GOOGLE_APPLICATION_CREDENTIALS  (path to service account JSON file)
+    """
+    if not fieldnames or not rows:
+        return
+    spreadsheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+    if not spreadsheet_id:
+        return
+    try:
+        import gspread
+        creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "").strip()
+        if creds_json:
+            credentials = json.loads(creds_json)
+            gc = gspread.service_account_from_dict(credentials)
+        else:
+            gc = gspread.service_account()
+
+        sh = gc.open_by_key(spreadsheet_id)
+        try:
+            ws = sh.worksheet(sheet_name)
+        except Exception:
+            ws = sh.add_worksheet(title=sheet_name, rows=1000, cols=max(20, len(fieldnames)))
+            ws.append_row(fieldnames, value_input_option="RAW")
+
+        existing_header = ws.row_values(1)
+        if not existing_header:
+            ws.append_row(fieldnames, value_input_option="RAW")
+        elif existing_header != fieldnames:
+            # Preserve old columns and append any new columns at the end.
+            merged = list(existing_header)
+            for name in fieldnames:
+                if name not in merged:
+                    merged.append(name)
+            if merged != existing_header:
+                ws.update("1:1", [merged])
+            fieldnames = merged
+
+        values = [[str(row.get(col, "")) for col in fieldnames] for row in rows]
+        ws.append_rows(values, value_input_option="RAW")
+    except Exception as exc:
+        _append_log(f"Google Sheets append failed ({sheet_name}): {type(exc).__name__}: {exc}")
+
+
+def _latest_cost_value_from_logs(text: str) -> float:
+    metrics = _latest_token_metrics_from_logs(text)
+    value = metrics.get("cost_so_far_usd") if isinstance(metrics, dict) else None
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _finalize_run_outputs(sid: str) -> None:
+    state = _state(sid)
+    if state.get("finalized_once"):
+        return
+    state["finalized_once"] = True
+
+    text = "\n".join(state.get("logs", []))
+    result = _run_result()
+    ended_at = datetime.now(timezone.utc).isoformat()
+    form = dict(state.get("last_form", {}))
+    session_csv = _csv_path_for_session(sid)
+    fieldnames, rows = _read_csv_rows(session_csv)
+
+    enriched_rows: list[dict[str, Any]] = []
+    if rows and fieldnames:
+        extra_fields = [
+            "launcher_session_id",
+            "launcher_result",
+            "launcher_ended_at_utc",
+            "launcher_auto_key_used",
+            "launcher_final_cost_usd",
+        ]
+        merged_fields = list(fieldnames)
+        for col in extra_fields:
+            if col not in merged_fields:
+                merged_fields.append(col)
+        cost = _latest_cost_value_from_logs(text)
+        for row in rows:
+            out = dict(row)
+            out.update({
+                "launcher_session_id": sid,
+                "launcher_result": result,
+                "launcher_ended_at_utc": ended_at,
+                "launcher_auto_key_used": "1" if state.get("auto_key_used") else "0",
+                "launcher_final_cost_usd": f"{cost:.8f}",
+            })
+            enriched_rows.append(out)
+        _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
+        _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
+
+    if state.get("auto_key_used"):
+        cost = _latest_cost_value_from_logs(text)
+        day = datetime.now().strftime("%Y-%m-%d")
+        cost_fields = ["date", "session_id", "ended_at_utc", "provider", "model_name", "result", "cost_usd"]
+        cost_row = {
+            "date": day,
+            "session_id": sid,
+            "ended_at_utc": ended_at,
+            "provider": form.get("api_provider", ""),
+            "model_name": form.get("model_name", ""),
+            "result": result,
+            "cost_usd": f"{cost:.8f}",
+        }
+        _append_rows_to_csv(AUTO_KEY_DAILY_COSTS_CSV, cost_fields, [cost_row])
+        _append_rows_to_google_sheet("auto_key_daily_costs", cost_fields, [cost_row])
+
+
+def _session_html_files(sid: str) -> list[Path]:
+    out_dir = (ROOT / _session_output_dir(sid)).resolve()
+    if not out_dir.exists():
+        return []
+    return sorted([p for p in out_dir.rglob("*.html") if p.is_file()])
+
+
+def _make_results_zip(sid: str) -> Path:
+    state = _state(sid)
+    out_dir = (ROOT / _session_output_dir(sid)).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = out_dir / f"session_results_{sid}.zip"
+    session_csv = _csv_path_for_session(sid)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if session_csv.exists():
+            zf.write(session_csv, arcname="results.csv")
+        for html_path in _session_html_files(sid):
+            if html_path == zip_path:
+                continue
+            try:
+                zf.write(html_path, arcname=str(Path("html") / html_path.relative_to(out_dir)))
+            except Exception:
+                zf.write(html_path, arcname=str(Path("html") / html_path.name))
+        log_path = out_dir / "launcher_logs.txt"
+        log_path.write_text("\n".join(state.get("logs", [])), encoding="utf-8")
+        zf.write(log_path, arcname="launcher_logs.txt")
+    return zip_path
 
 
 def _reader_thread(pipe) -> None:
@@ -436,189 +617,6 @@ def _write_target_dfa_html() -> str:
 
 
 
-
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _today_utc() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
-def _session_results_csv_path(sid: str) -> Path:
-    form = sessions.get(sid, {}).get("last_form", DEFAULT_LAST_FORM)
-    return ROOT / _session_output_dir(sid) / form.get("experiment_csv", "results.csv")
-
-
-def _count_csv_rows(path: Path) -> int:
-    if not path.exists():
-        return 0
-    try:
-        with path.open("r", encoding="utf-8", newline="") as f:
-            return sum(1 for _ in csv.DictReader(f))
-    except Exception:
-        return 0
-
-
-def _append_rows_to_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    existing_fields: list[str] = []
-    if path.exists():
-        try:
-            with path.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.reader(f)
-                existing_fields = next(reader, [])
-        except Exception:
-            existing_fields = []
-    merged_fields: list[str] = []
-    for name in list(existing_fields) + list(fieldnames):
-        if name and name not in merged_fields:
-            merged_fields.append(name)
-    if path.exists() and existing_fields and existing_fields != merged_fields:
-        try:
-            with path.open("r", encoding="utf-8", newline="") as f:
-                old_rows = list(csv.DictReader(f))
-            with path.open("w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=merged_fields)
-                writer.writeheader()
-                for row in old_rows:
-                    writer.writerow({k: row.get(k, "") for k in merged_fields})
-        except Exception:
-            pass
-    write_header = not path.exists() or path.stat().st_size == 0
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=merged_fields)
-        if write_header:
-            writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in merged_fields})
-
-
-def _sync_session_results_to_global(sid: str) -> None:
-    state = _state(sid)
-    path = _session_results_csv_path(sid)
-    if not path.exists():
-        return
-    try:
-        with path.open("r", encoding="utf-8", newline="") as f:
-            rows = list(csv.DictReader(f))
-    except Exception as exc:
-        _append_log(f"Global results sync failed: {type(exc).__name__}: {exc}")
-        return
-
-    already = int(state.get("synced_result_rows", 0) or 0)
-    new_rows = rows[already:]
-    if not new_rows:
-        state["synced_result_rows"] = len(rows)
-        return
-
-    finished_at = _now_utc_iso()
-    run_id = str(state.get("current_run_id") or "")
-    auto_used = bool(state.get("auto_api_key_used"))
-    final_cost = _final_cost_from_logs("\n".join(state["logs"]))
-
-    enriched_rows: list[dict[str, Any]] = []
-    extra_fields = [
-        "launcher_session_id",
-        "launcher_run_id",
-        "launcher_finished_at_utc",
-        "launcher_auto_api_key_used",
-        "launcher_final_cost_usd",
-        "launcher_source_csv",
-    ]
-    for row in new_rows:
-        enriched = dict(row)
-        enriched.update({
-            "launcher_session_id": sid,
-            "launcher_run_id": run_id,
-            "launcher_finished_at_utc": finished_at,
-            "launcher_auto_api_key_used": "1" if auto_used else "0",
-            "launcher_final_cost_usd": "" if final_cost is None else f"{final_cost:.8f}",
-            "launcher_source_csv": str(path),
-        })
-        enriched_rows.append(enriched)
-
-    fieldnames = list(rows[0].keys()) + extra_fields if rows else extra_fields
-    try:
-        _append_rows_to_csv(GLOBAL_RESULTS_CSV, enriched_rows, fieldnames)
-        state["synced_result_rows"] = len(rows)
-        _append_log(f"Global results saved: {GLOBAL_RESULTS_CSV}")
-    except Exception as exc:
-        _append_log(f"Global results save failed: {type(exc).__name__}: {exc}")
-
-
-def _final_cost_from_logs(text: str) -> float | None:
-    metrics = _token_metrics_by_step_from_logs(text)
-    if not metrics:
-        return None
-    return _cost_so_far_from_step_metrics(metrics)
-
-
-def _record_auto_key_cost_if_needed(sid: str) -> None:
-    state = _state(sid)
-    if not state.get("auto_api_key_used"):
-        return
-    cost = _final_cost_from_logs("\n".join(state["logs"]))
-    if cost is None:
-        return
-
-    day = _today_utc()
-    run_row = {
-        "date_utc": day,
-        "finished_at_utc": _now_utc_iso(),
-        "launcher_session_id": sid,
-        "launcher_run_id": str(state.get("current_run_id") or ""),
-        "provider": state["last_form"].get("api_provider", ""),
-        "model_name": state["last_form"].get("model_name", ""),
-        "cost_usd": f"{cost:.8f}",
-        "result": _run_result(),
-    }
-
-    try:
-        _append_rows_to_csv(AUTO_KEY_RUN_COSTS_CSV, [run_row], list(run_row.keys()))
-    except Exception as exc:
-        _append_log(f"Auto-key run cost save failed: {type(exc).__name__}: {exc}")
-
-    try:
-        daily_rows: list[dict[str, str]] = []
-        if AUTO_KEY_DAILY_COSTS_CSV.exists():
-            with AUTO_KEY_DAILY_COSTS_CSV.open("r", encoding="utf-8", newline="") as f:
-                daily_rows = list(csv.DictReader(f))
-        found = False
-        for row in daily_rows:
-            if row.get("date_utc") == day:
-                old_total = float(row.get("total_cost_usd") or 0)
-                old_runs = int(float(row.get("runs") or 0))
-                row["total_cost_usd"] = f"{old_total + cost:.8f}"
-                row["runs"] = str(old_runs + 1)
-                row["updated_at_utc"] = _now_utc_iso()
-                found = True
-                break
-        if not found:
-            daily_rows.append({
-                "date_utc": day,
-                "total_cost_usd": f"{cost:.8f}",
-                "runs": "1",
-                "updated_at_utc": _now_utc_iso(),
-            })
-        AUTO_KEY_DAILY_COSTS_CSV.parent.mkdir(parents=True, exist_ok=True)
-        with AUTO_KEY_DAILY_COSTS_CSV.open("w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["date_utc", "total_cost_usd", "runs", "updated_at_utc"])
-            writer.writeheader()
-            writer.writerows(daily_rows)
-        _append_log(f"Auto-key daily cost updated: {AUTO_KEY_DAILY_COSTS_CSV}")
-    except Exception as exc:
-        _append_log(f"Auto-key daily cost save failed: {type(exc).__name__}: {exc}")
-
-
-def _server_google_key_for_flash_lite(provider: str, model_name: str) -> str:
-    normalized = re.sub(r"\s*\([^)]*\)\s*$", "", (model_name or "").strip())
-    if (provider or "").strip().lower() == "google" and normalized == "gemini-3.1-flash-lite-preview":
-        return os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
-    return ""
-
 def _popen_kwargs_for_stoppable_process() -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -678,8 +676,6 @@ def _run_command(cmd: list[str], sid: str) -> None:
     state["running"] = True
     if not state["logs"]:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
-    if state.get("auto_api_key_used"):
-        _append_log("AUTO_API_KEY_USED::google_flash_lite")
     state["current_full_report_path"] = ""
     _append_log("Launcher started.")
 
@@ -724,13 +720,13 @@ def _run_command(cmd: list[str], sid: str) -> None:
     except Exception as exc:
         _append_log(f"Launcher error: {type(exc).__name__}: {exc}")
     finally:
+        state["running"] = False
+        state["process"] = None
         try:
-            _sync_session_results_to_global(sid)
-            _record_auto_key_cost_if_needed(sid)
-        finally:
-            state["running"] = False
-            state["process"] = None
-            _current_sid.reset(token)
+            _finalize_run_outputs(sid)
+        except Exception as exc:
+            _append_log(f"Launcher finalize error: {type(exc).__name__}: {exc}")
+        _current_sid.reset(token)
 
 def _extract_tool_json_blocks(text: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -1493,8 +1489,8 @@ button{width:100%;margin-top:12px;padding:9px 14px;border:0;border-radius:11px;b
 button.secondary{background:#475467}
 button.new-game{background:#16a34a}
 button.analysis-btn{background:#7c3aed}
-.download-link{display:block;width:100%;margin-top:10px;padding:9px 14px;border-radius:11px;background:#0f766e;color:white!important;font-weight:700;text-align:center;text-decoration:none;font-size:13px}
-.download-link.secondary-download{background:#64748b}
+.end-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:12px}
+.end-actions button{margin-top:0}
 #status{display:inline-block;padding:4px 10px;border-radius:999px;background:#eff8ff;color:#175cd3;font-weight:800;font-size:12px}
 .status-won{background:var(--win)!important;color:#166534!important}
 .status-lost,.status-crashed{background:var(--lose)!important;color:#991b1b!important}
@@ -1558,6 +1554,20 @@ let renderLocked = false;
 let lockedFrameSrcByCall = {};
 
 function escapeHtml(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function isFlashLiteSelected(){
+  const provider=document.getElementById('api_provider') ? document.getElementById('api_provider').value : '';
+  const model=document.getElementById('model_name') ? document.getElementById('model_name').value.replace(/\s*\([^)]*\)\s*$/, '') : '';
+  return provider === 'google' && model === 'gemini-3.1-flash-lite-preview';
+}
+function updateApiKeyVisibility(){
+  const apiKeyBox=document.getElementById('api_key_box');
+  const apiKeyInput=document.getElementById('api_key');
+  if(!apiKeyBox || !apiKeyInput) return;
+  const hide = isFlashLiteSelected();
+  apiKeyBox.classList.toggle('hidden', hide);
+  apiKeyInput.required = !hide;
+  if(hide){ apiKeyInput.value=''; }
+}
 function updateModels(){
   const provider=document.getElementById('api_provider').value;
   const modelSelect=document.getElementById('model_name');
@@ -1566,6 +1576,7 @@ function updateModels(){
   modelSelect.innerHTML='';
   models.forEach(m=>{const opt=document.createElement('option'); opt.value=m; opt.textContent=m; if(m===current) opt.selected=true; modelSelect.appendChild(opt);});
   modelSelect.dataset.initial='';
+  updateApiKeyVisibility();
 }
 function updateTargetSource(){
   const src=document.getElementById('target_source') ? document.getElementById('target_source').value : 'dataset';
@@ -1632,6 +1643,8 @@ function showMode(data){
     game.classList.add('hidden');
   }
   document.getElementById('new_game_btn').classList.toggle('hidden', !ended);
+  const dlBtn = document.getElementById('download_results_btn');
+  if(dlBtn){ dlBtn.classList.toggle('hidden', !ended); }
   const stopBtn = document.getElementById('stop_btn');
   if(stopBtn){ stopBtn.classList.toggle('hidden', !data.running); }
   updateAnalysisButton(data);
@@ -1789,7 +1802,17 @@ function renderEvents(events, isRunning, result, budgetExhausted){
     html += `<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`;
   }
   const eventsKey = JSON.stringify({
-    events: events || [],
+    events: (events || []).map(ev => ({
+      type: ev.type || '',
+      call: ev.call || '',
+      agent: ev.agent || '',
+      oracle: ev.oracle || '',
+      oracle_class: ev.oracle_class || '',
+      iframe: ev.iframe || '',
+      analysis: ev.analysis || {},
+      passive: ev.passive || {},
+      similarity: ev.similarity || {}
+    })),
     isRunning: isRunning,
     result: result || '',
     budgetExhausted: !!budgetExhausted
@@ -1902,6 +1925,7 @@ function resetToStartScreenKeepKey(){
   const status=document.getElementById('status');
   const saveNote=document.getElementById('save-note');
   const tokenUsage=document.getElementById('token-usage-footer');
+  const dlBtn=document.getElementById('download_results_btn');
 
   if(chat){ chat.innerHTML=''; chat.classList.remove('hidden'); }
   if(full){ full.classList.add('hidden'); full.removeAttribute('src'); full.dataset.src=''; }
@@ -1910,8 +1934,12 @@ function resetToStartScreenKeepKey(){
   if(status){ status.textContent='Not in game'; status.className=''; }
   if(saveNote){ saveNote.innerHTML=''; saveNote.classList.add('hidden'); }
   if(tokenUsage){ tokenUsage.innerHTML=''; tokenUsage.classList.add('hidden'); }
+  if(dlBtn){ dlBtn.classList.add('hidden'); }
 }
 
+function downloadResultsZip(){
+  window.location.href = '/download_results_zip';
+}
 function stopRun(){
   fetch('/stop',{method:'POST'}).then(() => {
     forceForm=false;
@@ -1936,6 +1964,7 @@ function newGame(){
   const status=document.getElementById('status');
   const saveNote=document.getElementById('save-note');
   const tokenUsage=document.getElementById('token-usage-footer');
+  const dlBtn=document.getElementById('download_results_btn');
   if(chat){ chat.innerHTML=''; chat.classList.remove('hidden'); }
   if(full){ full.classList.add('hidden'); full.removeAttribute('src'); full.dataset.src=''; }
   const target=document.getElementById('target_iframe');
@@ -1944,6 +1973,7 @@ function newGame(){
   if(status){ status.textContent='Not in game'; status.className=''; }
   if(saveNote){ saveNote.innerHTML=''; saveNote.classList.add('hidden'); }
   if(tokenUsage){ tokenUsage.innerHTML=''; tokenUsage.classList.add('hidden'); }
+  if(dlBtn){ dlBtn.classList.add('hidden'); }
   refreshEvents();
 }
 function showAnalysis(){
@@ -1970,7 +2000,7 @@ function showAnalysis(){
   refreshEvents();
 }
 setInterval(refreshEvents,800);
-window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
+window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();refreshEvents();};
 </script>
 </head>
 <body>
@@ -1983,9 +2013,9 @@ window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
       <form method="post" action="/run">
         <div class="row">
           <div><label>API Provider</label><select id="api_provider" name="api_provider" onchange="updateModels()">{% for p in providers %}<option value="{{p}}" {% if form.api_provider==p %}selected{% endif %}>{{p}}</option>{% endfor %}</select></div>
-          <div><label>Model</label><select id="model_name" name="model_name" data-initial="{{form.model_name}}"></select></div>
+          <div><label>Model</label><select id="model_name" name="model_name" data-initial="{{form.model_name}}" onchange="updateApiKeyVisibility()"></select></div>
         </div>
-        <label>API Key</label><input type="password" name="api_key" autocomplete="off" value="{{form.api_key}}"><p class="small">Optional for Gemini Flash Lite when a server Google key is configured. For other models, enter your own key.</p>
+        <div id="api_key_box"><label>API Key</label><input id="api_key" type="password" name="api_key" autocomplete="off" value="{{form.api_key}}"></div>
         <label>Target Automaton Source</label>
         <select id="target_source" name="target_source" onchange="updateTargetSource()">
           <option value="regex" {% if form.target_source=="regex" %}selected{% endif %}>User regular expression → DFA</option>
@@ -2021,7 +2051,6 @@ window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
         </details>
         <button type="submit">Run</button>
       </form>
-      <a class="download-link secondary-download" href="/download_session_results">Download my session CSV</a>
     </div>
 
     <div id="game-panel" class="hidden" style="text-align:center;">
@@ -2036,8 +2065,10 @@ window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
       <p class="small">You can zoom and drag inside the DFA view to inspect the automaton.</p>
       <button id="stop_btn" type="button" class="secondary hidden" onclick="stopRun()">Stop current run</button>
       <button id="analysis_btn" type="button" class="analysis-btn hidden" onclick="showAnalysis()">Show full game analysis</button>
-      <button id="new_game_btn" type="button" class="new-game hidden" onclick="newGame()">New game</button>
-      <a class="download-link" href="/download_session_results">Download my session CSV</a>
+      <div class="end-actions">
+        <button id="download_results_btn" type="button" class="secondary hidden" onclick="downloadResultsZip()">Download results ZIP</button>
+        <button id="new_game_btn" type="button" class="new-game hidden" onclick="newGame()">New game</button>
+      </div>
     </div>
   </div>
   <div id="output-card" class="card output-card hidden">
@@ -2065,7 +2096,7 @@ def index():
         alphabet_sizes=alphabet_sizes,
         ratios=ratios,
         counterexample_modes=COUNTEREXAMPLE_MODES,
-        form=dict(_state()["last_form"]),
+        form={**dict(_state()["last_form"]), "api_key": "" if _is_flash_lite_model(_state()["last_form"].get("api_provider", ""), _state()["last_form"].get("model_name", "")) else dict(_state()["last_form"]).get("api_key", "")},
     )
 
 
@@ -2084,19 +2115,22 @@ def run():
 
     form["output_dir"] = _session_output_dir(sid)
     Path(form["output_dir"]).mkdir(parents=True, exist_ok=True)
-    state["current_run_id"] = uuid.uuid4().hex
 
-    submitted_api_key = form.get("api_key", "").strip()
-    server_api_key = "" if submitted_api_key else _server_google_key_for_flash_lite(form.get("api_provider", ""), form.get("model_name", ""))
-    effective_api_key = submitted_api_key or server_api_key
-    state["auto_api_key_used"] = bool(server_api_key and not submitted_api_key)
+    state["auto_key_used"] = False
+    state["finalized_once"] = False
+    if _is_flash_lite_model(form.get("api_provider", ""), form.get("model_name", "")) and not form.get("api_key", "").strip():
+        server_google_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if server_google_key:
+            form["api_key"] = server_google_key
+            state["auto_key_used"] = True
+    elif not form.get("api_key", "").strip():
+        state["running"] = False
+        return "API key is required for this model. The server GOOGLE_API_KEY is used only for gemini-3.1-flash-lite-preview.", 400
 
     state["current_full_report_path"] = ""
     state["current_target_path"] = ""
     state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
-    if state.get("auto_api_key_used"):
-        _append_log("AUTO_API_KEY_USED::google_flash_lite")
 
     try:
         flag_path = state["stop_flag_path"]
@@ -2110,7 +2144,7 @@ def run():
         sys.executable, "-u", "main.py",
         "--api-provider", form["api_provider"],
         "--model-name", form["model_name"],
-        "--api-key", effective_api_key,
+        "--api-key", form["api_key"],
         "--n-states", form["n_states"],
         "--seed", form["seed"],
         "--alphabet-size", form["alphabet_size"],
@@ -2384,52 +2418,14 @@ def local_file_route():
         return Response(f"Failed to read file: {type(exc).__name__}: {exc}", status=500)
 
 
-@app.get("/download_session_results")
-def download_session_results():
+@app.get("/download_results_zip")
+def download_results_zip():
     sid = _get_sid()
-    path = _session_results_csv_path(sid)
-    if not path.exists():
-        header = "message\n"
-        body = "No runs were saved in this browser session yet.\n"
-        content = header + body
-    else:
-        content = path.read_text(encoding="utf-8", errors="replace")
-    filename = f"automata_session_{sid[:12]}_results.csv"
-    return Response(
-        content,
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
-
-
-@app.get("/download_global_results")
-def download_global_results():
-    token = request.args.get("token", "")
-    admin_token = os.environ.get("LAUNCHER_ADMIN_TOKEN", "")
-    if admin_token and token != admin_token:
-        return Response("Forbidden", status=403)
-    if not GLOBAL_RESULTS_CSV.exists():
-        return Response("No global results saved yet.\n", mimetype="text/plain; charset=utf-8")
-    return Response(
-        GLOBAL_RESULTS_CSV.read_text(encoding="utf-8", errors="replace"),
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=all_users_results.csv"},
-    )
-
-
-@app.get("/download_auto_key_daily_costs")
-def download_auto_key_daily_costs():
-    token = request.args.get("token", "")
-    admin_token = os.environ.get("LAUNCHER_ADMIN_TOKEN", "")
-    if admin_token and token != admin_token:
-        return Response("Forbidden", status=403)
-    if not AUTO_KEY_DAILY_COSTS_CSV.exists():
-        return Response("No auto-key daily costs saved yet.\n", mimetype="text/plain; charset=utf-8")
-    return Response(
-        AUTO_KEY_DAILY_COSTS_CSV.read_text(encoding="utf-8", errors="replace"),
-        mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=auto_key_daily_costs.csv"},
-    )
+    try:
+        zip_path = _make_results_zip(sid)
+        return send_file(zip_path, as_attachment=True, download_name="automata_run_results.zip", mimetype="application/zip")
+    except Exception as exc:
+        return Response(f"Failed to create results ZIP: {type(exc).__name__}: {exc}", status=500)
 
 
 @app.get("/logs")
