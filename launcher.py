@@ -540,20 +540,6 @@ def _upload_file_to_google_drive(path: Path, sid: str, out_dir: Path, service=No
         _append_log(f"Google Drive upload failed for {path}: {type(exc).__name__}: {exc}")
         return "", ""
 
-def _materialize_results_html_for_drive(sid: str, out_dir: Path) -> None:
-    """Write the downloadable results table as a real HTML artifact before Drive upload."""
-    session_csv = _csv_path_for_session(sid)
-    if not session_csv.exists():
-        return
-    try:
-        target = out_dir / "html" / "results.html"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_results_html_table_for_zip(session_csv, sid, out_dir), encoding="utf-8")
-        _append_log(f"Drive upload prepared results HTML: {target}")
-    except Exception as exc:
-        _append_log(f"Drive results HTML prepare failed: {type(exc).__name__}: {exc}")
-
-
 def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path]:
     """Collect HTML artifacts from the session output tree plus explicit log/CSV references."""
     files: set[Path] = set()
@@ -580,22 +566,7 @@ def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path
             except Exception:
                 continue
 
-    state = _state(sid)
-    for explicit in (
-        state.get("current_target_path", ""),
-        state.get("current_full_report_path", ""),
-    ):
-        add_ref(str(explicit or ""))
-
-    for explicit_func in (_latest_game_display_path, _target_dfa_path):
-        try:
-            explicit_path = explicit_func()
-            if explicit_path:
-                add_ref(str(explicit_path))
-        except Exception:
-            pass
-
-    text = "\n".join(state.get("logs", []))
+    text = "\n".join(_state(sid).get("logs", []))
     for m in re.finditer(r'([A-Za-z]:[/\\][^\s,;"\'<>]+?\.html|file:/{2,3}[^\s,;"\'<>]+?\.html|/opt/render/[^\s,;"\'<>]+?\.html|(?:html|DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons)/[^\s,;"\'<>]+?\.html)', text, flags=re.IGNORECASE):
         add_ref(m.group(1))
 
@@ -698,8 +669,57 @@ def _update_drive_html_file(service, file_id: str, html_text: str, filename: str
         _append_log(f"Google Drive HTML rewrite upload failed for {filename}: {type(exc).__name__}: {exc}")
 
 
+def _remember_drive_upload(
+    drive_links: dict[str, str],
+    drive_file_ids: dict[str, str],
+    path: Path,
+    out_dir: Path,
+    link: str,
+    file_id: str,
+) -> None:
+    if not link:
+        return
+    rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
+    keys = {
+        str(path.resolve()),
+        rel,
+        path.name,
+        path.as_posix(),
+        str(path),
+        (out_dir / rel).as_posix(),
+        f"file:///{path.resolve().as_posix()}",
+    }
+    for key in keys:
+        if key:
+            drive_links[key] = link
+            if file_id:
+                drive_file_ids[key] = file_id
+
+
+def _write_download_results_html_file(sid: str, out_dir: Path) -> Path | None:
+    session_csv = _csv_path_for_session(sid)
+    if not session_csv.exists():
+        return None
+    try:
+        results_html = out_dir / "results.html"
+        results_html.parent.mkdir(parents=True, exist_ok=True)
+        results_html.write_text(_results_html_table_for_zip(session_csv, sid, out_dir), encoding="utf-8")
+        return results_html
+    except Exception as exc:
+        _append_log(f"Could not create results.html before Drive upload: {type(exc).__name__}: {exc}")
+        return None
+
+
 def _ensure_drive_artifacts_uploaded(sid: str, *, force: bool = False) -> dict[str, str]:
-    """Upload all session HTML files to Drive, then rewrite uploaded HTML to Drive-link internals."""
+    """Upload every HTML artifact from this run to Google Drive.
+
+    The previous implementation created the Drive folder successfully but could
+    still upload zero files when the final report was not discovered by the scan.
+    This version has three safeguards:
+      1. upload every .html under the per-session output dir,
+      2. upload every .html explicitly mentioned in logs/CSV,
+      3. always create and upload results.html from the CSV as a fallback.
+    """
     state = _state(sid)
     if state.get("drive_uploaded_once") and not force:
         return dict(state.get("drive_links") or {})
@@ -717,35 +737,42 @@ def _ensure_drive_artifacts_uploaded(sid: str, *, force: bool = False) -> dict[s
         return drive_links
 
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
-    _materialize_results_html_for_drive(sid, out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     html_files = _all_session_html_files_and_references(sid, out_dir)
+    results_html_path = _write_download_results_html_file(sid, out_dir)
+    if results_html_path and results_html_path.exists():
+        html_files = sorted({*html_files, results_html_path.resolve()})
+
     _append_log(f"Google Drive upload scan found {len(html_files)} HTML artifact(s): " + ", ".join(p.name for p in html_files[:20]))
 
     uploaded = 0
+    failed = 0
     for path in html_files:
         link, file_id = _upload_file_to_google_drive(path, sid, out_dir, service=service)
         if not link:
+            failed += 1
             continue
-        rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
-        keys = {
-            str(path.resolve()),
-            rel,
-            path.name,
-            path.as_posix(),
-            str(path),
-            (out_dir / rel).as_posix(),
-        }
-        for key in keys:
-            drive_links[key] = link
-            if file_id:
-                drive_file_ids[key] = file_id
+        _remember_drive_upload(drive_links, drive_file_ids, path, out_dir, link, file_id)
         uploaded += 1
 
     state["drive_links"] = drive_links
     state["drive_file_ids"] = drive_file_ids
 
-    # Second pass: now that every artifact has a Drive URL, update the uploaded
-    # HTML contents so internal EQ/SIM/report links also point to Drive.
+    session_csv = _csv_path_for_session(sid)
+    if drive_links and session_csv.exists():
+        _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+
+    # Recreate results.html after CSV rewriting, so its table contains Drive links.
+    results_html_path = _write_download_results_html_file(sid, out_dir)
+    if results_html_path and results_html_path.exists():
+        link, file_id = _upload_file_to_google_drive(results_html_path, sid, out_dir, service=service)
+        if link:
+            _remember_drive_upload(drive_links, drive_file_ids, results_html_path, out_dir, link, file_id)
+            state["drive_links"] = drive_links
+            state["drive_file_ids"] = drive_file_ids
+            uploaded += 1 if results_html_path not in html_files else 0
+
     rewritten = 0
     for path in html_files:
         rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
@@ -753,14 +780,15 @@ def _ensure_drive_artifacts_uploaded(sid: str, *, force: bool = False) -> dict[s
         if not file_id:
             continue
         rewritten_html = _html_content_with_drive_links(path, sid, out_dir, drive_links)
-        _update_drive_html_file(service, file_id, rewritten_html, _drive_safe_name(path, out_dir, sid))
-        rewritten += 1
+        if rewritten_html:
+            _update_drive_html_file(service, file_id, rewritten_html, _drive_safe_name(path, out_dir, sid))
+            rewritten += 1
 
     state["drive_uploaded_once"] = True
     if uploaded:
-        _append_log(f"Google Drive upload complete: {uploaded} HTML artifact(s), {rewritten} rewritten with Drive links.")
+        _append_log(f"Google Drive upload complete: uploaded={uploaded}, failed={failed}, rewritten={rewritten}.")
     else:
-        _append_log("Google Drive upload finished, but no HTML artifacts were found/uploaded.")
+        _append_log("Google Drive upload failed: no HTML files were uploaded. Check the detailed Google Drive upload failed lines above.")
     return drive_links
 
 
@@ -790,62 +818,36 @@ def _drive_link_for_html_reference(value: str, sid: str, out_dir: Path, drive_li
     return ""
 
 
-def _primary_conversation_drive_link(sid: str, out_dir: Path, drive_links: dict[str, str]) -> str:
-    """Return the Drive link for the main session conversation HTML."""
-    candidates: list[Path] = []
-    try:
-        candidates.extend(sorted((out_dir / "html").glob("session_*.html")))
-    except Exception:
-        pass
-    try:
-        candidates.extend([p for p in _all_session_html_files_and_references(sid, out_dir) if p.name.startswith("session_")])
-    except Exception:
-        pass
-    if not candidates:
-        try:
-            candidates.extend(_all_session_html_files_and_references(sid, out_dir))
-        except Exception:
-            pass
-    for path in candidates:
-        try:
-            rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
-            for key in (rel, str(path.resolve()), path.name, path.as_posix(), str(path)):
-                link = drive_links.get(key)
-                if link:
-                    return link
-            link = _drive_link_for_html_reference(rel, sid, out_dir, drive_links)
-            if link:
-                return link
-        except Exception:
-            continue
-    return ""
-
-
 def _replace_html_references_with_drive_links(row: dict[str, Any], sid: str, out_dir: Path, drive_links: dict[str, str]) -> dict[str, Any]:
-    """Replace every local/Render HTML reference in a CSV row with Google Drive links.
-
-    The important user-facing column is conversation_link. If the original CSV
-    row contains a local file:/// or Render path there, it is replaced by the
-    uploaded Drive URL for the main session HTML. The same replacement is also
-    applied to any other column that contains an HTML artifact path.
-    """
+    """Replace HTML path values in a CSV row with stable Google Drive links."""
     out = dict(row)
     html_link_values: list[str] = []
-
     for key, value in list(out.items()):
         text = str(value or "")
-        if ".html" not in text.lower() and "html_artifact" not in text.lower() and "file:" not in text.lower():
+        if ".html" not in text.lower():
             continue
         drive_link = _drive_link_for_html_reference(text, sid, out_dir, drive_links)
         if drive_link:
             out[key] = drive_link
             html_link_values.append(drive_link)
 
-    primary_link = _primary_conversation_drive_link(sid, out_dir, drive_links)
-    current_conversation = str(out.get("conversation_link", "") or "")
-    if primary_link and (not current_conversation or not current_conversation.startswith(("https://drive.google.com/", "http://drive.google.com/"))):
-        out["conversation_link"] = primary_link
-        html_link_values.insert(0, primary_link)
+    # Important: the user-facing CSV must have a Drive URL specifically in
+    # conversation_link. If the exact original session HTML was not found for
+    # any reason, fall back to the uploaded results.html rather than leaving a
+    # local file:/// or Render path in that column.
+    conversation_value = str(out.get("conversation_link", "") or "")
+    conversation_is_drive = conversation_value.startswith(("https://drive.google.com/", "http://drive.google.com/"))
+    if not conversation_is_drive:
+        fallback = (
+            drive_links.get("html/session.html")
+            or drive_links.get("session.html")
+            or drive_links.get("results.html")
+            or next((v for k, v in drive_links.items() if str(k).endswith("results.html")), "")
+            or (html_link_values[0] if html_link_values else "")
+        )
+        if fallback:
+            out["conversation_link"] = fallback
+            html_link_values.insert(0, fallback)
 
     if html_link_values:
         out["launcher_drive_html_links"] = " | ".join(dict.fromkeys(html_link_values))
@@ -933,9 +935,11 @@ def _finalize_run_outputs(sid: str) -> None:
         _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
         has_drive_html_link = any(str(row.get("conversation_link", "")).startswith(("https://drive.google.com/", "http://drive.google.com/")) or bool(row.get("launcher_drive_html_links")) for row in enriched_rows)
         if has_drive_html_link:
-            _append_log("Google Drive links are ready. Google Sheets will be updated once the user downloads the results.")
+            _append_rows_to_google_sheet("results", merged_fields, enriched_rows)
+            _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
+            state["download_sheets_synced_once"] = True
         else:
-            _append_log("Google Sheets append deferred: no Google Drive HTML link was created yet, so local file links will not be written to Sheets.")
+            _append_log("Google Sheets append skipped: no Google Drive HTML link was created, so local file links were not written to Sheets.")
 
     if state.get("auto_key_used"):
         cost = _latest_cost_value_from_logs(text)
