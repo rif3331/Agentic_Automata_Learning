@@ -10,26 +10,26 @@ import subprocess
 import signal
 import sys
 import threading
+import uuid
+import contextvars
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
-from flask import Flask, request, render_template_string, Response, jsonify, redirect, url_for, send_from_directory
+from flask import Flask, request, render_template_string, Response, jsonify, redirect, url_for, send_from_directory, session
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key-for-production")
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_RESULTS_CSV = ROOT / "runs" / "results.csv"
 FALLBACK_RESULTS_CSV = ROOT / "results.csv"
+GLOBAL_RESULTS_CSV = ROOT / "runs" / "all_users_results.csv"
+AUTO_KEY_RUN_COSTS_CSV = ROOT / "runs" / "auto_key_run_costs.csv"
+AUTO_KEY_DAILY_COSTS_CSV = ROOT / "runs" / "auto_key_daily_costs.csv"
 
-logs: list[str] = []
-running = False
-process: subprocess.Popen | None = None
-current_target_path: str = ""
-current_full_report_path: str = ""
-STOP_REQUEST_FLAG_PATH = ROOT / "STOP_REQUESTED.flag"
-
-last_form: dict[str, str] = {
+DEFAULT_LAST_FORM: dict[str, str] = {
     "api_provider": "google",
     "model_name": "gemini-3.1-flash-lite-preview",
     "api_key": "",
@@ -43,6 +43,98 @@ last_form: dict[str, str] = {
     "output_dir": "runs",
     "experiment_csv": "results.csv",
 }
+
+_current_sid: contextvars.ContextVar[str | None] = contextvars.ContextVar("launcher_current_sid", default=None)
+sessions_lock = threading.RLock()
+sessions: dict[str, dict[str, Any]] = {}
+
+
+def _get_sid() -> str:
+    sid = _current_sid.get()
+    if sid:
+        return sid
+    sid = session.get("sid")
+    if not sid:
+        sid = uuid.uuid4().hex
+        session["sid"] = sid
+    return str(sid)
+
+
+def _session_output_dir(sid: str) -> str:
+    return str(Path("runs") / "sessions" / sid)
+
+
+def _new_session_state(sid: str) -> dict[str, Any]:
+    form = dict(DEFAULT_LAST_FORM)
+    form["output_dir"] = _session_output_dir(sid)
+    return {
+        "logs": [],
+        "running": False,
+        "process": None,
+        "current_target_path": "",
+        "current_full_report_path": "",
+        "last_form": form,
+        "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
+        "synced_result_rows": 0,
+        "current_run_id": "",
+        "auto_api_key_used": False,
+    }
+
+
+def _state(sid: str | None = None) -> dict[str, Any]:
+    sid = sid or _get_sid()
+    with sessions_lock:
+        if sid not in sessions:
+            sessions[sid] = _new_session_state(sid)
+            try:
+                sessions[sid]["synced_result_rows"] = _count_csv_rows(_session_results_csv_path(sid))
+            except Exception:
+                sessions[sid]["synced_result_rows"] = 0
+        return sessions[sid]
+
+
+class _SessionLogsProxy:
+    def _logs(self) -> list[str]:
+        return _state()["logs"]
+    def append(self, value: str) -> None:
+        self._logs().append(value)
+    def clear(self) -> None:
+        self._logs().clear()
+    def __iter__(self) -> Iterator[str]:
+        return iter(list(self._logs()))
+    def __len__(self) -> int:
+        return len(self._logs())
+    def __bool__(self) -> bool:
+        return bool(self._logs())
+    def __getitem__(self, item):
+        return self._logs()[item]
+    def __delitem__(self, item) -> None:
+        del self._logs()[item]
+
+
+class _SessionFormProxy:
+    def _form(self) -> dict[str, str]:
+        return _state()["last_form"]
+    def __getitem__(self, key: str) -> str:
+        return self._form()[key]
+    def __setitem__(self, key: str, value: str) -> None:
+        self._form()[key] = value
+    def get(self, key: str, default: str = "") -> str:
+        return self._form().get(key, default)
+    def keys(self):
+        return list(self._form().keys())
+    def items(self):
+        return self._form().items()
+    def values(self):
+        return self._form().values()
+    def __iter__(self):
+        return iter(self._form())
+    def __len__(self) -> int:
+        return len(self._form())
+
+
+logs = _SessionLogsProxy()
+last_form = _SessionFormProxy()
 
 PROVIDER_MODELS: dict[str, list[str]] = {
     "google": [
@@ -344,6 +436,189 @@ def _write_target_dfa_html() -> str:
 
 
 
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _session_results_csv_path(sid: str) -> Path:
+    form = sessions.get(sid, {}).get("last_form", DEFAULT_LAST_FORM)
+    return ROOT / _session_output_dir(sid) / form.get("experiment_csv", "results.csv")
+
+
+def _count_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            return sum(1 for _ in csv.DictReader(f))
+    except Exception:
+        return 0
+
+
+def _append_rows_to_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing_fields: list[str] = []
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.reader(f)
+                existing_fields = next(reader, [])
+        except Exception:
+            existing_fields = []
+    merged_fields: list[str] = []
+    for name in list(existing_fields) + list(fieldnames):
+        if name and name not in merged_fields:
+            merged_fields.append(name)
+    if path.exists() and existing_fields and existing_fields != merged_fields:
+        try:
+            with path.open("r", encoding="utf-8", newline="") as f:
+                old_rows = list(csv.DictReader(f))
+            with path.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=merged_fields)
+                writer.writeheader()
+                for row in old_rows:
+                    writer.writerow({k: row.get(k, "") for k in merged_fields})
+        except Exception:
+            pass
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=merged_fields)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in merged_fields})
+
+
+def _sync_session_results_to_global(sid: str) -> None:
+    state = _state(sid)
+    path = _session_results_csv_path(sid)
+    if not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as exc:
+        _append_log(f"Global results sync failed: {type(exc).__name__}: {exc}")
+        return
+
+    already = int(state.get("synced_result_rows", 0) or 0)
+    new_rows = rows[already:]
+    if not new_rows:
+        state["synced_result_rows"] = len(rows)
+        return
+
+    finished_at = _now_utc_iso()
+    run_id = str(state.get("current_run_id") or "")
+    auto_used = bool(state.get("auto_api_key_used"))
+    final_cost = _final_cost_from_logs("\n".join(state["logs"]))
+
+    enriched_rows: list[dict[str, Any]] = []
+    extra_fields = [
+        "launcher_session_id",
+        "launcher_run_id",
+        "launcher_finished_at_utc",
+        "launcher_auto_api_key_used",
+        "launcher_final_cost_usd",
+        "launcher_source_csv",
+    ]
+    for row in new_rows:
+        enriched = dict(row)
+        enriched.update({
+            "launcher_session_id": sid,
+            "launcher_run_id": run_id,
+            "launcher_finished_at_utc": finished_at,
+            "launcher_auto_api_key_used": "1" if auto_used else "0",
+            "launcher_final_cost_usd": "" if final_cost is None else f"{final_cost:.8f}",
+            "launcher_source_csv": str(path),
+        })
+        enriched_rows.append(enriched)
+
+    fieldnames = list(rows[0].keys()) + extra_fields if rows else extra_fields
+    try:
+        _append_rows_to_csv(GLOBAL_RESULTS_CSV, enriched_rows, fieldnames)
+        state["synced_result_rows"] = len(rows)
+        _append_log(f"Global results saved: {GLOBAL_RESULTS_CSV}")
+    except Exception as exc:
+        _append_log(f"Global results save failed: {type(exc).__name__}: {exc}")
+
+
+def _final_cost_from_logs(text: str) -> float | None:
+    metrics = _token_metrics_by_step_from_logs(text)
+    if not metrics:
+        return None
+    return _cost_so_far_from_step_metrics(metrics)
+
+
+def _record_auto_key_cost_if_needed(sid: str) -> None:
+    state = _state(sid)
+    if not state.get("auto_api_key_used"):
+        return
+    cost = _final_cost_from_logs("\n".join(state["logs"]))
+    if cost is None:
+        return
+
+    day = _today_utc()
+    run_row = {
+        "date_utc": day,
+        "finished_at_utc": _now_utc_iso(),
+        "launcher_session_id": sid,
+        "launcher_run_id": str(state.get("current_run_id") or ""),
+        "provider": state["last_form"].get("api_provider", ""),
+        "model_name": state["last_form"].get("model_name", ""),
+        "cost_usd": f"{cost:.8f}",
+        "result": _run_result(),
+    }
+
+    try:
+        _append_rows_to_csv(AUTO_KEY_RUN_COSTS_CSV, [run_row], list(run_row.keys()))
+    except Exception as exc:
+        _append_log(f"Auto-key run cost save failed: {type(exc).__name__}: {exc}")
+
+    try:
+        daily_rows: list[dict[str, str]] = []
+        if AUTO_KEY_DAILY_COSTS_CSV.exists():
+            with AUTO_KEY_DAILY_COSTS_CSV.open("r", encoding="utf-8", newline="") as f:
+                daily_rows = list(csv.DictReader(f))
+        found = False
+        for row in daily_rows:
+            if row.get("date_utc") == day:
+                old_total = float(row.get("total_cost_usd") or 0)
+                old_runs = int(float(row.get("runs") or 0))
+                row["total_cost_usd"] = f"{old_total + cost:.8f}"
+                row["runs"] = str(old_runs + 1)
+                row["updated_at_utc"] = _now_utc_iso()
+                found = True
+                break
+        if not found:
+            daily_rows.append({
+                "date_utc": day,
+                "total_cost_usd": f"{cost:.8f}",
+                "runs": "1",
+                "updated_at_utc": _now_utc_iso(),
+            })
+        AUTO_KEY_DAILY_COSTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+        with AUTO_KEY_DAILY_COSTS_CSV.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["date_utc", "total_cost_usd", "runs", "updated_at_utc"])
+            writer.writeheader()
+            writer.writerows(daily_rows)
+        _append_log(f"Auto-key daily cost updated: {AUTO_KEY_DAILY_COSTS_CSV}")
+    except Exception as exc:
+        _append_log(f"Auto-key daily cost save failed: {type(exc).__name__}: {exc}")
+
+
+def _server_google_key_for_flash_lite(provider: str, model_name: str) -> str:
+    normalized = re.sub(r"\s*\([^)]*\)\s*$", "", (model_name or "").strip())
+    if (provider or "").strip().lower() == "google" and normalized == "gemini-3.1-flash-lite-preview":
+        return os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    return ""
+
 def _popen_kwargs_for_stoppable_process() -> dict[str, Any]:
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
@@ -397,12 +672,15 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
     except Exception:
         pass
 
-def _run_command(cmd: list[str]) -> None:
-    global running, process, current_full_report_path
-    running = True
-    if not logs:
+def _run_command(cmd: list[str], sid: str) -> None:
+    token = _current_sid.set(sid)
+    state = _state(sid)
+    state["running"] = True
+    if not state["logs"]:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
-    current_full_report_path = ""
+    if state.get("auto_api_key_used"):
+        _append_log("AUTO_API_KEY_USED::google_flash_lite")
+    state["current_full_report_path"] = ""
     _append_log("Launcher started.")
 
     safe_cmd = []
@@ -422,9 +700,11 @@ def _run_command(cmd: list[str]) -> None:
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
+    env["LAUNCHER_SESSION_ID"] = sid
+    env["STOP_REQUEST_FLAG_PATH"] = str(state["stop_flag_path"])
 
     try:
-        process = subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
             stdout=subprocess.PIPE,
@@ -436,15 +716,21 @@ def _run_command(cmd: list[str]) -> None:
             env=env,
             **_popen_kwargs_for_stoppable_process(),
         )
-        _reader_thread(process.stdout)
-        code = process.wait()
+        state["process"] = proc
+        if proc.stdout is not None:
+            _reader_thread(proc.stdout)
+        code = proc.wait()
         _append_log(f"Launcher finished with exit code {code}.")
     except Exception as exc:
         _append_log(f"Launcher error: {type(exc).__name__}: {exc}")
     finally:
-        running = False
-        process = None
-
+        try:
+            _sync_session_results_to_global(sid)
+            _record_auto_key_cost_if_needed(sid)
+        finally:
+            state["running"] = False
+            state["process"] = None
+            _current_sid.reset(token)
 
 def _extract_tool_json_blocks(text: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -699,7 +985,7 @@ def _run_result() -> str:
         return "lost"
     if "GAME CRASHED" in txt or "Launcher error" in txt or "RUN STOPPED BY USER" in txt:
         return "crashed"
-    return "running" if running else "idle"
+    return "running" if _state().get("running") else "idle"
 
 
 def _is_query_limit_reached(text: str) -> bool:
@@ -886,7 +1172,7 @@ def _events_from_logs() -> list[dict[str, str]]:
     confirmed_calls = _confirmed_tool_call_numbers_from_logs(text)
 
     initial_prompt = _initial_prompt_from_logs(text)
-    if not initial_prompt and (running or "BUDGET_WAIT::" in text):
+    if not initial_prompt and (_state().get("running") or "BUDGET_WAIT::" in text):
         events.append({
             "type": "budget_wait",
             "call": "",
@@ -1207,6 +1493,8 @@ button{width:100%;margin-top:12px;padding:9px 14px;border:0;border-radius:11px;b
 button.secondary{background:#475467}
 button.new-game{background:#16a34a}
 button.analysis-btn{background:#7c3aed}
+.download-link{display:block;width:100%;margin-top:10px;padding:9px 14px;border-radius:11px;background:#0f766e;color:white!important;font-weight:700;text-align:center;text-decoration:none;font-size:13px}
+.download-link.secondary-download{background:#64748b}
 #status{display:inline-block;padding:4px 10px;border-radius:999px;background:#eff8ff;color:#175cd3;font-weight:800;font-size:12px}
 .status-won{background:var(--win)!important;color:#166534!important}
 .status-lost,.status-crashed{background:var(--lose)!important;color:#991b1b!important}
@@ -1697,7 +1985,7 @@ window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
           <div><label>API Provider</label><select id="api_provider" name="api_provider" onchange="updateModels()">{% for p in providers %}<option value="{{p}}" {% if form.api_provider==p %}selected{% endif %}>{{p}}</option>{% endfor %}</select></div>
           <div><label>Model</label><select id="model_name" name="model_name" data-initial="{{form.model_name}}"></select></div>
         </div>
-        <label>API Key</label><input type="password" name="api_key" autocomplete="off" value="{{form.api_key}}" required>
+        <label>API Key</label><input type="password" name="api_key" autocomplete="off" value="{{form.api_key}}"><p class="small">Optional for Gemini Flash Lite when a server Google key is configured. For other models, enter your own key.</p>
         <label>Target Automaton Source</label>
         <select id="target_source" name="target_source" onchange="updateTargetSource()">
           <option value="regex" {% if form.target_source=="regex" %}selected{% endif %}>User regular expression → DFA</option>
@@ -1733,6 +2021,7 @@ window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
         </details>
         <button type="submit">Run</button>
       </form>
+      <a class="download-link secondary-download" href="/download_session_results">Download my session CSV</a>
     </div>
 
     <div id="game-panel" class="hidden" style="text-align:center;">
@@ -1748,6 +2037,7 @@ window.onload=()=>{updateModels();updateTargetSource();refreshEvents();};
       <button id="stop_btn" type="button" class="secondary hidden" onclick="stopRun()">Stop current run</button>
       <button id="analysis_btn" type="button" class="analysis-btn hidden" onclick="showAnalysis()">Show full game analysis</button>
       <button id="new_game_btn" type="button" class="new-game hidden" onclick="newGame()">New game</button>
+      <a class="download-link" href="/download_session_results">Download my session CSV</a>
     </div>
   </div>
   <div id="output-card" class="card output-card hidden">
@@ -1775,60 +2065,79 @@ def index():
         alphabet_sizes=alphabet_sizes,
         ratios=ratios,
         counterexample_modes=COUNTEREXAMPLE_MODES,
-        form=last_form,
+        form=dict(_state()["last_form"]),
     )
 
 
 @app.post("/run")
 def run():
-    global running, last_form, current_target_path, current_full_report_path
-    if running:
-        return "A run is already active. Stop it first or wait until it finishes.", 409
+    sid = _get_sid()
+    state = _state(sid)
+    if state["running"]:
+        return "A run is already active in this browser session. Stop it first or wait until it finishes.", 409
 
-    # Lock immediately, before the background thread starts.
-    # This prevents double-clicks / repeated Run clicks from starting multiple games.
-    running = True
+    state["running"] = True
 
-    for key in last_form.keys():
-        last_form[key] = request.form.get(key, last_form[key]).strip()
+    form = state["last_form"]
+    for key in list(form.keys()):
+        form[key] = request.form.get(key, form[key]).strip()
 
-    current_full_report_path = ""
-    current_target_path = ""
+    form["output_dir"] = _session_output_dir(sid)
+    Path(form["output_dir"]).mkdir(parents=True, exist_ok=True)
+    state["current_run_id"] = uuid.uuid4().hex
 
-    logs.clear()
+    submitted_api_key = form.get("api_key", "").strip()
+    server_api_key = "" if submitted_api_key else _server_google_key_for_flash_lite(form.get("api_provider", ""), form.get("model_name", ""))
+    effective_api_key = submitted_api_key or server_api_key
+    state["auto_api_key_used"] = bool(server_api_key and not submitted_api_key)
+
+    state["current_full_report_path"] = ""
+    state["current_target_path"] = ""
+    state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
+    if state.get("auto_api_key_used"):
+        _append_log("AUTO_API_KEY_USED::google_flash_lite")
+
+    try:
+        flag_path = state["stop_flag_path"]
+        flag_path.parent.mkdir(parents=True, exist_ok=True)
+        if flag_path.exists():
+            flag_path.unlink()
+    except Exception:
+        pass
 
     cmd = [
         sys.executable, "-u", "main.py",
-        "--api-provider", last_form["api_provider"],
-        "--model-name", last_form["model_name"],
-        "--api-key", last_form["api_key"],
-        "--n-states", last_form["n_states"],
-        "--seed", last_form["seed"],
-        "--alphabet-size", last_form["alphabet_size"],
-        "--target-source", last_form["target_source"],
-        "--regex", last_form["regex"],
-        "--counterexample-mode", last_form["counterexample_mode"],
-        "--algorithm-approximation-ratio", last_form["algorithm_approximation_ratio"],
-        "--output-dir", last_form["output_dir"],
-        "--experiment-csv", last_form["experiment_csv"],
+        "--api-provider", form["api_provider"],
+        "--model-name", form["model_name"],
+        "--api-key", effective_api_key,
+        "--n-states", form["n_states"],
+        "--seed", form["seed"],
+        "--alphabet-size", form["alphabet_size"],
+        "--target-source", form["target_source"],
+        "--regex", form["regex"],
+        "--counterexample-mode", form["counterexample_mode"],
+        "--algorithm-approximation-ratio", form["algorithm_approximation_ratio"],
+        "--output-dir", form["output_dir"],
+        "--experiment-csv", form["experiment_csv"],
     ]
-    threading.Thread(target=_run_command, args=(cmd,), daemon=True).start()
+    threading.Thread(target=_run_command, args=(cmd, sid), daemon=True).start()
     return redirect(url_for("index"))
-
 
 @app.post("/stop")
 def stop():
-    global process, running, current_full_report_path, current_target_path
-
+    sid = _get_sid()
+    state = _state(sid)
     _append_log("RUN STOPPED BY USER")
 
     try:
-        STOP_REQUEST_FLAG_PATH.write_text("stop", encoding="utf-8")
+        flag_path = state["stop_flag_path"]
+        flag_path.parent.mkdir(parents=True, exist_ok=True)
+        flag_path.write_text("stop", encoding="utf-8")
     except Exception as exc:
         _append_log(f"Launcher stop flag error: {type(exc).__name__}: {exc}")
 
-    proc = process
+    proc = state.get("process")
     if proc and proc.poll() is None:
         _request_process_stop(proc)
         try:
@@ -1844,28 +2153,28 @@ def stop():
             _append_log(f"Launcher stop wait error: {type(exc).__name__}: {exc}")
             _kill_process_tree(proc)
 
-    running = False
-    process = None
-    current_full_report_path = ""
-    current_target_path = ""
+    state["running"] = False
+    state["process"] = None
+    state["current_full_report_path"] = ""
+    state["current_target_path"] = ""
     return "ok"
-
 
 @app.get("/events")
 def get_events():
+    state = _state()
     game_path = _latest_game_display_path()
 
     target_path = _target_dfa_path()
     target_url = _path_to_url(target_path, "raw") if target_path else ""
 
-    text = "\n".join(logs)
+    text = "\n".join(state["logs"])
     budget_exhausted = _is_tool_budget_exhausted(text)
 
     events = _events_from_logs()
     result = _run_result()
 
     return jsonify({
-        "running": running,
+        "running": state["running"],
         "result": result,
         "failure_type": _failure_type_from_events(events) if result == "lost" else "",
         "events": events,
@@ -1875,7 +2184,6 @@ def get_events():
         "save_note": _result_save_note_from_logs(text),
         "token_metrics": _latest_token_metrics_from_logs(text),
     })
-
 
 def _zoomed_html_document(content: str, scale: float = 0.28) -> str:
     """Wrap a DFA HTML artifact so it appears zoomed out with no scrollbars."""
@@ -2076,9 +2384,57 @@ def local_file_route():
         return Response(f"Failed to read file: {type(exc).__name__}: {exc}", status=500)
 
 
+@app.get("/download_session_results")
+def download_session_results():
+    sid = _get_sid()
+    path = _session_results_csv_path(sid)
+    if not path.exists():
+        header = "message\n"
+        body = "No runs were saved in this browser session yet.\n"
+        content = header + body
+    else:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    filename = f"automata_session_{sid[:12]}_results.csv"
+    return Response(
+        content,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/download_global_results")
+def download_global_results():
+    token = request.args.get("token", "")
+    admin_token = os.environ.get("LAUNCHER_ADMIN_TOKEN", "")
+    if admin_token and token != admin_token:
+        return Response("Forbidden", status=403)
+    if not GLOBAL_RESULTS_CSV.exists():
+        return Response("No global results saved yet.\n", mimetype="text/plain; charset=utf-8")
+    return Response(
+        GLOBAL_RESULTS_CSV.read_text(encoding="utf-8", errors="replace"),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=all_users_results.csv"},
+    )
+
+
+@app.get("/download_auto_key_daily_costs")
+def download_auto_key_daily_costs():
+    token = request.args.get("token", "")
+    admin_token = os.environ.get("LAUNCHER_ADMIN_TOKEN", "")
+    if admin_token and token != admin_token:
+        return Response("Forbidden", status=403)
+    if not AUTO_KEY_DAILY_COSTS_CSV.exists():
+        return Response("No auto-key daily costs saved yet.\n", mimetype="text/plain; charset=utf-8")
+    return Response(
+        AUTO_KEY_DAILY_COSTS_CSV.read_text(encoding="utf-8", errors="replace"),
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=auto_key_daily_costs.csv"},
+    )
+
+
 @app.get("/logs")
 def get_logs():
-    return Response("\n".join(logs), mimetype="text/plain; charset=utf-8")
+    return Response("\n".join(_state()["logs"]), mimetype="text/plain; charset=utf-8")
 
 
 if __name__ == "__main__":
