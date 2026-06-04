@@ -760,18 +760,63 @@ def _drive_link_for_html_reference(value: str, sid: str, out_dir: Path, drive_li
     return ""
 
 
+def _primary_conversation_drive_link(sid: str, out_dir: Path, drive_links: dict[str, str]) -> str:
+    """Return the Drive link for the main session conversation HTML."""
+    candidates: list[Path] = []
+    try:
+        candidates.extend(sorted((out_dir / "html").glob("session_*.html")))
+    except Exception:
+        pass
+    try:
+        candidates.extend([p for p in _all_session_html_files_and_references(sid, out_dir) if p.name.startswith("session_")])
+    except Exception:
+        pass
+    if not candidates:
+        try:
+            candidates.extend(_all_session_html_files_and_references(sid, out_dir))
+        except Exception:
+            pass
+    for path in candidates:
+        try:
+            rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
+            for key in (rel, str(path.resolve()), path.name, path.as_posix(), str(path)):
+                link = drive_links.get(key)
+                if link:
+                    return link
+            link = _drive_link_for_html_reference(rel, sid, out_dir, drive_links)
+            if link:
+                return link
+        except Exception:
+            continue
+    return ""
+
+
 def _replace_html_references_with_drive_links(row: dict[str, Any], sid: str, out_dir: Path, drive_links: dict[str, str]) -> dict[str, Any]:
-    """Replace HTML path values in a CSV row with stable Google Drive links."""
+    """Replace every local/Render HTML reference in a CSV row with Google Drive links.
+
+    The important user-facing column is conversation_link. If the original CSV
+    row contains a local file:/// or Render path there, it is replaced by the
+    uploaded Drive URL for the main session HTML. The same replacement is also
+    applied to any other column that contains an HTML artifact path.
+    """
     out = dict(row)
     html_link_values: list[str] = []
+
     for key, value in list(out.items()):
         text = str(value or "")
-        if ".html" not in text.lower():
+        if ".html" not in text.lower() and "html_artifact" not in text.lower() and "file:" not in text.lower():
             continue
         drive_link = _drive_link_for_html_reference(text, sid, out_dir, drive_links)
         if drive_link:
             out[key] = drive_link
             html_link_values.append(drive_link)
+
+    primary_link = _primary_conversation_drive_link(sid, out_dir, drive_links)
+    current_conversation = str(out.get("conversation_link", "") or "")
+    if primary_link and (not current_conversation or not current_conversation.startswith(("https://drive.google.com/", "http://drive.google.com/"))):
+        out["conversation_link"] = primary_link
+        html_link_values.insert(0, primary_link)
+
     if html_link_values:
         out["launcher_drive_html_links"] = " | ".join(dict.fromkeys(html_link_values))
     return out
@@ -858,11 +903,9 @@ def _finalize_run_outputs(sid: str) -> None:
         _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
         has_drive_html_link = any(str(row.get("conversation_link", "")).startswith(("https://drive.google.com/", "http://drive.google.com/")) or bool(row.get("launcher_drive_html_links")) for row in enriched_rows)
         if has_drive_html_link:
-            _append_rows_to_google_sheet("results", merged_fields, enriched_rows)
-            _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
-            state["download_sheets_synced_once"] = True
+            _append_log("Google Drive links are ready. Google Sheets will be updated once the user downloads the results.")
         else:
-            _append_log("Google Sheets append skipped: no Google Drive HTML link was created, so local file links were not written to Sheets.")
+            _append_log("Google Sheets append deferred: no Google Drive HTML link was created yet, so local file links will not be written to Sheets.")
 
     if state.get("auto_key_used"):
         cost = _latest_cost_value_from_logs(text)
