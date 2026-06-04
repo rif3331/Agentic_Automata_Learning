@@ -540,6 +540,20 @@ def _upload_file_to_google_drive(path: Path, sid: str, out_dir: Path, service=No
         _append_log(f"Google Drive upload failed for {path}: {type(exc).__name__}: {exc}")
         return "", ""
 
+def _materialize_results_html_for_drive(sid: str, out_dir: Path) -> None:
+    """Write the downloadable results table as a real HTML artifact before Drive upload."""
+    session_csv = _csv_path_for_session(sid)
+    if not session_csv.exists():
+        return
+    try:
+        target = out_dir / "html" / "results.html"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_results_html_table_for_zip(session_csv, sid, out_dir), encoding="utf-8")
+        _append_log(f"Drive upload prepared results HTML: {target}")
+    except Exception as exc:
+        _append_log(f"Drive results HTML prepare failed: {type(exc).__name__}: {exc}")
+
+
 def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path]:
     """Collect HTML artifacts from the session output tree plus explicit log/CSV references."""
     files: set[Path] = set()
@@ -566,7 +580,22 @@ def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path
             except Exception:
                 continue
 
-    text = "\n".join(_state(sid).get("logs", []))
+    state = _state(sid)
+    for explicit in (
+        state.get("current_target_path", ""),
+        state.get("current_full_report_path", ""),
+    ):
+        add_ref(str(explicit or ""))
+
+    for explicit_func in (_latest_game_display_path, _target_dfa_path):
+        try:
+            explicit_path = explicit_func()
+            if explicit_path:
+                add_ref(str(explicit_path))
+        except Exception:
+            pass
+
+    text = "\n".join(state.get("logs", []))
     for m in re.finditer(r'([A-Za-z]:[/\\][^\s,;"\'<>]+?\.html|file:/{2,3}[^\s,;"\'<>]+?\.html|/opt/render/[^\s,;"\'<>]+?\.html|(?:html|DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons)/[^\s,;"\'<>]+?\.html)', text, flags=re.IGNORECASE):
         add_ref(m.group(1))
 
@@ -688,8 +717,9 @@ def _ensure_drive_artifacts_uploaded(sid: str, *, force: bool = False) -> dict[s
         return drive_links
 
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
+    _materialize_results_html_for_drive(sid, out_dir)
     html_files = _all_session_html_files_and_references(sid, out_dir)
-    _append_log(f"Google Drive upload scan found {len(html_files)} HTML artifact(s).")
+    _append_log(f"Google Drive upload scan found {len(html_files)} HTML artifact(s): " + ", ".join(p.name for p in html_files[:20]))
 
     uploaded = 0
     for path in html_files:
