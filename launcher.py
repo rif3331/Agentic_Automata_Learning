@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import csv
 import html as html_lib
+import io
 import json
 import os
 import re
@@ -83,7 +84,7 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "auto_key_used": False,
         "finalized_once": False,
         "drive_links": {},
-        "drive_session_folder_url": "",
+        "drive_uploaded_once": False,
     }
 
 
@@ -339,178 +340,203 @@ def _append_rows_to_google_sheet(sheet_name: str, fieldnames: list[str], rows: l
             fieldnames = merged
 
         values = [[str(row.get(col, "")) for col in fieldnames] for row in rows]
-        ws.append_rows(values, value_input_option="USER_ENTERED")
+        ws.append_rows(values, value_input_option="RAW")
     except Exception as exc:
         _append_log(f"Google Sheets append failed ({sheet_name}): {type(exc).__name__}: {exc}")
 
 
 
-def _google_credentials_from_env(scopes: list[str]):
-    """Load the same Service Account credentials used by Sheets/Drive."""
+
+def _google_service_account_info() -> dict[str, Any] | None:
     creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON", "").strip()
     if creds_json:
-        from google.oauth2 import service_account
-        info = json.loads(creds_json)
-        return service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        try:
+            return json.loads(creds_json)
+        except Exception as exc:
+            _append_log(f"Google credentials JSON parse failed: {type(exc).__name__}: {exc}")
+            return None
 
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     if creds_path:
-        from google.oauth2 import service_account
-        return service_account.Credentials.from_service_account_file(creds_path, scopes=scopes)
+        try:
+            return json.loads(Path(creds_path).read_text(encoding="utf-8"))
+        except Exception as exc:
+            _append_log(f"Google credentials file read failed: {type(exc).__name__}: {exc}")
+            return None
 
     return None
 
 
-def _drive_service():
+def _google_drive_service():
+    """Return a Google Drive service client, or None when Drive is not configured."""
     folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     if not folder_id:
         return None
+
+    info = _google_service_account_info()
+    if not info:
+        _append_log("Google Drive upload skipped: GOOGLE_SHEETS_CREDENTIALS_JSON is not configured.")
+        return None
+
     try:
+        from google.oauth2 import service_account
         from googleapiclient.discovery import build
-        credentials = _google_credentials_from_env(["https://www.googleapis.com/auth/drive"])
-        if credentials is None:
-            return None
-        return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+        scopes = ["https://www.googleapis.com/auth/drive.file"]
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
     except Exception as exc:
-        _append_log(f"Google Drive setup failed: {type(exc).__name__}: {exc}")
+        _append_log(f"Google Drive service init failed: {type(exc).__name__}: {exc}")
         return None
 
 
-def _drive_file_link(file_id: str) -> str:
-    return f"https://drive.google.com/file/d/{file_id}/view?usp=drivesdk"
+def _drive_safe_name(path: Path, out_dir: Path, sid: str) -> str:
+    rel = _zip_relative_path_for_session_file(path, out_dir).replace("/", "__").replace("\\", "__")
+    rel = re.sub(r"[^A-Za-z0-9_.-]+", "_", rel)
+    return f"{sid}__{rel}"
 
 
-def _drive_folder_link(folder_id: str) -> str:
-    return f"https://drive.google.com/drive/folders/{folder_id}"
-
-
-def _drive_create_session_folder(service, sid: str) -> tuple[str, str]:
+def _ensure_drive_run_folder(service, sid: str) -> str:
+    """Create/get a per-session folder inside GOOGLE_DRIVE_FOLDER_ID."""
     parent_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
     if not parent_id:
-        return "", ""
-    name = f"automata_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sid[:8]}"
-    metadata = {
-        "name": name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_id],
-    }
-    created = service.files().create(body=metadata, fields="id, webViewLink", supportsAllDrives=True).execute()
-    folder_id = created.get("id", "")
-    folder_url = created.get("webViewLink") or _drive_folder_link(folder_id)
-    return folder_id, folder_url
+        return ""
 
+    state = _state(sid)
+    existing = str(state.get("drive_run_folder_id") or "").strip()
+    if existing:
+        return existing
 
-def _drive_make_public_if_requested(service, file_id: str) -> None:
-    # Default is public links, because the user wants links in CSV/Sheets to open from anywhere.
-    if os.environ.get("GOOGLE_DRIVE_PUBLIC_LINKS", "1").strip().lower() in {"0", "false", "no"}:
-        return
+    folder_name = f"automata_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sid[:10]}"
     try:
-        service.permissions().create(
-            fileId=file_id,
-            body={"type": "anyone", "role": "reader"},
-            fields="id",
+        metadata = {
+            "name": folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id],
+        }
+        created = service.files().create(
+            body=metadata,
+            fields="id,webViewLink",
             supportsAllDrives=True,
         ).execute()
+        folder_id = created.get("id", "")
+        if folder_id:
+            state["drive_run_folder_id"] = folder_id
+            state["drive_run_folder_link"] = created.get("webViewLink", "")
+            if os.environ.get("GOOGLE_DRIVE_SHARE_PUBLIC", "1").strip().lower() not in {"0", "false", "no"}:
+                try:
+                    service.permissions().create(
+                        fileId=folder_id,
+                        body={"type": "anyone", "role": "reader"},
+                        fields="id",
+                        supportsAllDrives=True,
+                    ).execute()
+                except Exception as exc:
+                    _append_log(f"Google Drive folder permission failed: {type(exc).__name__}: {exc}")
+        return folder_id
     except Exception as exc:
-        _append_log(f"Google Drive permission failed for {file_id}: {type(exc).__name__}: {exc}")
+        _append_log(f"Google Drive run-folder creation failed: {type(exc).__name__}: {exc}")
+        return parent_id
 
 
-def _drive_upload_bytes(service, parent_id: str, name: str, content: bytes, mime_type: str) -> tuple[str, str]:
-    from googleapiclient.http import MediaIoBaseUpload
-    import io
-    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
-    metadata = {"name": name, "parents": [parent_id]}
-    created = service.files().create(
-        body=metadata,
-        media_body=media,
-        fields="id, webViewLink",
-        supportsAllDrives=True,
-    ).execute()
-    file_id = created.get("id", "")
-    _drive_make_public_if_requested(service, file_id)
-    link = created.get("webViewLink") or _drive_file_link(file_id)
-    return file_id, link
+def _upload_file_to_google_drive(path: Path, sid: str, out_dir: Path, service=None) -> tuple[str, str]:
+    """Upload one artifact to Drive and return (browser_link, file_id)."""
+    parent_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    if not parent_folder_id or not path.exists() or not path.is_file():
+        return "", ""
+
+    service = service or _google_drive_service()
+    if service is None:
+        return "", ""
+
+    try:
+        from googleapiclient.http import MediaFileUpload
+
+        run_folder_id = _ensure_drive_run_folder(service, sid) or parent_folder_id
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        media = MediaFileUpload(str(path), mimetype=mime_type, resumable=False)
+        metadata = {
+            "name": _drive_safe_name(path, out_dir, sid),
+            "parents": [run_folder_id],
+            "mimeType": mime_type,
+        }
+        created = service.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id,webViewLink,webContentLink",
+            supportsAllDrives=True,
+        ).execute()
+        file_id = created.get("id", "")
+        if not file_id:
+            return "", ""
+
+        if os.environ.get("GOOGLE_DRIVE_SHARE_PUBLIC", "1").strip().lower() not in {"0", "false", "no"}:
+            try:
+                service.permissions().create(
+                    fileId=file_id,
+                    body={"type": "anyone", "role": "reader"},
+                    fields="id",
+                    supportsAllDrives=True,
+                ).execute()
+            except Exception as exc:
+                _append_log(f"Google Drive permission failed for {path.name}: {type(exc).__name__}: {exc}")
+
+        link = created.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+        return link, file_id
+    except Exception as exc:
+        _append_log(f"Google Drive upload failed for {path}: {type(exc).__name__}: {exc}")
+        return "", ""
 
 
-def _drive_update_bytes(service, file_id: str, content: bytes, mime_type: str) -> None:
-    from googleapiclient.http import MediaIoBaseUpload
-    import io
-    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
-    service.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+def _all_session_html_files_and_references(sid: str, out_dir: Path) -> list[Path]:
+    """Collect HTML artifacts from the session output tree plus explicit log/CSV references."""
+    files: set[Path] = set()
 
+    for p in _session_html_files(sid):
+        if p.exists() and p.is_file():
+            files.add(p.resolve())
 
-def _artifact_rel_from_reference(value: str, sid: str, out_dir: Path) -> str:
-    ref = _extract_first_html_reference(value) or str(value or "")
-    rel = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
-    rel = _normalize_zip_artifact_path(rel, out_dir).replace("\\", "/")
-    return rel
+    def add_ref(ref: str) -> None:
+        if not ref:
+            return
+        local = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
+        local = _normalize_zip_artifact_path(local, out_dir).replace("\\", "/")
+        candidates = [(out_dir / local)]
+        base = os.path.basename(local)
+        if base:
+            candidates.extend(out_dir.rglob(base))
+        for c in candidates:
+            try:
+                c = Path(c).resolve()
+                if c.exists() and c.is_file() and c.suffix.lower() == ".html":
+                    c.relative_to(out_dir)
+                    files.add(c)
+            except Exception:
+                continue
 
+    text = "\n".join(_state(sid).get("logs", []))
+    for m in re.finditer(r'([A-Za-z]:[/\\][^\s,;"\'<>]+?\.html|file:/{2,3}[^\s,;"\'<>]+?\.html|/opt/render/[^\s,;"\'<>]+?\.html|(?:html|DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons)/[^\s,;"\'<>]+?\.html)', text, flags=re.IGNORECASE):
+        add_ref(m.group(1))
 
-def _drive_link_for_reference(value: str, sid: str, out_dir: Path, drive_links: dict[str, str]) -> str:
-    if not value:
-        return ""
-    text = html_lib.unescape(str(value))
-    if "drive.google.com" in text:
-        m = re.search(r'https://drive\.google\.com/[^\s,"\'<>]+', text)
-        return m.group(0) if m else text.strip()
-    rel = _artifact_rel_from_reference(text, sid, out_dir)
-    if rel in drive_links:
-        return drive_links[rel]
-    base = os.path.basename(rel)
-    if base:
-        for k, v in drive_links.items():
-            if os.path.basename(k) == base:
-                return v
-    return ""
-
-
-def _make_drive_csv_value(value: str, sid: str, out_dir: Path, drive_links: dict[str, str]) -> str:
-    original = str(value or "")
-    link = _drive_link_for_reference(original, sid, out_dir, drive_links)
-    if link:
-        rel = _artifact_rel_from_reference(original, sid, out_dir)
-        label = rel or "Open HTML"
-        return f'=HYPERLINK("{link.replace(chr(34), chr(34)+chr(34))}","{label.replace(chr(34), chr(34)+chr(34))}")'
-    return original
-
-
-def _rewrite_csv_rows_with_drive_links(fieldnames: list[str], rows: list[dict[str, Any]], sid: str, out_dir: Path, drive_links: dict[str, str]) -> list[dict[str, Any]]:
-    if not drive_links:
-        return rows
-    out_rows: list[dict[str, Any]] = []
+    session_csv = _csv_path_for_session(sid)
+    _, rows = _read_csv_rows(session_csv)
     for row in rows:
-        out = dict(row)
-        for col in list(fieldnames):
-            value = str(out.get(col, ""))
-            if ".html" in value or "/html_artifact" in value or "file:" in value or "runs/sessions" in value:
-                out[col] = _make_drive_csv_value(value, sid, out_dir, drive_links)
-        out_rows.append(out)
-    return out_rows
+        for value in row.values():
+            ref = _extract_first_html_reference(str(value or ""))
+            if ref:
+                add_ref(ref)
 
-
-def _rewrite_session_csv_file_with_drive_links(session_csv: Path, sid: str, out_dir: Path, drive_links: dict[str, str]) -> tuple[list[str], list[dict[str, Any]]]:
-    fieldnames, rows = _read_csv_rows(session_csv)
-    if not fieldnames or not rows or not drive_links:
-        return fieldnames, rows
-    rewritten = _rewrite_csv_rows_with_drive_links(fieldnames, rows, sid, out_dir, drive_links)
-    tmp = session_csv.with_suffix(session_csv.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rewritten)
-    tmp.replace(session_csv)
-    return fieldnames, rewritten
+    return sorted(files)
 
 
 def _html_content_with_drive_links(path: Path, sid: str, out_dir: Path, drive_links: dict[str, str]) -> str:
+    """Rewrite HTML artifact links so EQ/SIM/internal links point to Drive URLs."""
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
 
-    current_rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
-
-    def to_drive_link(raw: str) -> str:
+    def to_drive_url(raw: str) -> str:
         raw = html_lib.unescape(str(raw or "").strip())
         if not raw or raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:") or raw.startswith("data:"):
             return raw
@@ -518,34 +544,27 @@ def _html_content_with_drive_links(path: Path, sid: str, out_dir: Path, drive_li
         if "#" in raw and not raw.startswith("#"):
             raw, anchor = raw.split("#", 1)
             anchor = "#" + anchor
-        rel = _artifact_rel_from_reference(raw, sid, out_dir)
-        link = drive_links.get(rel)
-        if not link:
-            base = os.path.basename(rel)
-            for k, v in drive_links.items():
-                if os.path.basename(k) == base:
-                    link = v
-                    break
-        return (link + anchor) if link else raw
+        link = _drive_link_for_html_reference(raw, sid, out_dir, drive_links)
+        if link:
+            return link + anchor
+        return raw + anchor
 
     def should_rewrite_url(url: str) -> bool:
         u = html_lib.unescape(str(url or ""))
         return (
-            u.endswith(".html")
-            or ".html#" in u
-            or "file:" in u
+            ".html" in u.lower()
+            or "file:" in u.lower()
             or "/html_artifact" in u
             or "/local_file" in u
             or "runs/sessions" in u
             or "/opt/render" in u
             or "AppData/Local/Temp" in u
-            or any(k in u for k in ["evaluations/", "language_similarity_details/", "DFA/", "html/"])
         )
 
     def repl_attr(match: re.Match[str]) -> str:
         attr, quote_char, url = match.group(1), match.group(2), match.group(3)
         if should_rewrite_url(url):
-            return f'{attr}={quote_char}{html_lib.escape(to_drive_link(url), quote=True)}{quote_char}'
+            return f'{attr}={quote_char}{html_lib.escape(to_drive_url(url), quote=True)}{quote_char}'
         return match.group(0)
 
     content = re.sub(r'\b(href|src)=("|\')(.*?)(?:\2)', repl_attr, content, flags=re.IGNORECASE | re.DOTALL)
@@ -553,7 +572,7 @@ def _html_content_with_drive_links(path: Path, sid: str, out_dir: Path, drive_li
     def repl_unquoted_attr(match: re.Match[str]) -> str:
         attr, url = match.group(1), match.group(2)
         if should_rewrite_url(url):
-            return f'{attr}="{html_lib.escape(to_drive_link(url), quote=True)}"'
+            return f'{attr}="{html_lib.escape(to_drive_url(url), quote=True)}"'
         return match.group(0)
 
     content = re.sub(r'\b(href|src)=([^\s>]+)', repl_unquoted_attr, content, flags=re.IGNORECASE)
@@ -561,62 +580,164 @@ def _html_content_with_drive_links(path: Path, sid: str, out_dir: Path, drive_li
     def repl_quoted_string(match: re.Match[str]) -> str:
         quote_char, value = match.group(1), match.group(2)
         if should_rewrite_url(value):
-            new_value = to_drive_link(value)
+            new_value = to_drive_url(value)
             return quote_char + new_value.replace("\\", "\\\\").replace(quote_char, "\\" + quote_char) + quote_char
         return match.group(0)
 
-    content = re.sub(
-        r'(["\'])([^"\']*?(?:file:/{2,3}|/html_artifact\?|/local_file\?|/opt/render/|AppData/Local/Temp|runs/sessions/|(?:html|DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons)/)[^"\']*?\.html(?:#[^"\']*)?)\1',
-        repl_quoted_string,
-        content,
-        flags=re.IGNORECASE,
-    )
+    content = re.sub(r'(["\'])([^"\']*?(?:\.html|file:|/html_artifact|/local_file|runs/sessions|/opt/render|AppData/Local/Temp)[^"\']*)\1', repl_quoted_string, content, flags=re.IGNORECASE)
 
-    content = content.replace("</body>", f'<div style="display:none" data-drive-fixed="1" data-artifact="{html_lib.escape(current_rel, quote=True)}"></div></body>')
+    marker = "<!-- Uploaded by launcher with Google Drive links -->"
+    if marker not in content:
+        content = content.replace("</body>", f"{marker}</body>", 1) if "</body>" in content else content + marker
     return content
 
 
-def _upload_session_html_to_drive(sid: str) -> tuple[dict[str, str], str]:
-    """Upload all session HTML artifacts to Google Drive and return rel-path -> Drive URL."""
-    service = _drive_service()
-    if service is None:
-        return {}, ""
-    out_dir = (ROOT / _session_output_dir(sid)).resolve()
-    html_files = _session_html_files(sid)
-    if not html_files:
-        return {}, ""
+def _update_drive_html_file(service, file_id: str, html_text: str, filename: str) -> None:
+    if not service or not file_id or not html_text:
+        return
     try:
-        session_folder_id, session_folder_url = _drive_create_session_folder(service, sid)
-        if not session_folder_id:
-            return {}, ""
-
-        file_ids: dict[str, str] = {}
-        drive_links: dict[str, str] = {}
-
-        # First upload placeholder/raw content to get stable Drive IDs for every HTML file.
-        for path in html_files:
-            rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
-            safe_name = rel.replace("/", "__")
-            raw = path.read_bytes()
-            file_id, link = _drive_upload_bytes(service, session_folder_id, safe_name, raw, "text/html")
-            file_ids[rel] = file_id
-            drive_links[rel] = link
-
-        # Then update every file so its internal EQ/SIM links point to Drive URLs too.
-        for path in html_files:
-            rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
-            file_id = file_ids.get(rel)
-            if not file_id:
-                continue
-            rewritten = _html_content_with_drive_links(path, sid, out_dir, drive_links)
-            if rewritten:
-                _drive_update_bytes(service, file_id, rewritten.encode("utf-8", errors="replace"), "text/html")
-
-        _append_log(f"Google Drive upload complete: {len(drive_links)} HTML files -> {session_folder_url}")
-        return drive_links, session_folder_url
+        from googleapiclient.http import MediaIoBaseUpload
+        media = MediaIoBaseUpload(
+            io.BytesIO(html_text.encode("utf-8", errors="replace")),
+            mimetype="text/html",
+            resumable=False,
+        )
+        service.files().update(
+            fileId=file_id,
+            media_body=media,
+            body={"mimeType": "text/html", "name": filename},
+            fields="id,webViewLink",
+            supportsAllDrives=True,
+        ).execute()
     except Exception as exc:
-        _append_log(f"Google Drive upload failed: {type(exc).__name__}: {exc}")
-        return {}, ""
+        _append_log(f"Google Drive HTML rewrite upload failed for {filename}: {type(exc).__name__}: {exc}")
+
+
+def _ensure_drive_artifacts_uploaded(sid: str, *, force: bool = False) -> dict[str, str]:
+    """Upload all session HTML files to Drive, then rewrite uploaded HTML to Drive-link internals."""
+    state = _state(sid)
+    if state.get("drive_uploaded_once") and not force:
+        return dict(state.get("drive_links") or {})
+
+    drive_links: dict[str, str] = {} if force else dict(state.get("drive_links") or {})
+    drive_file_ids: dict[str, str] = {} if force else dict(state.get("drive_file_ids") or {})
+
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    if not folder_id:
+        _append_log("Google Drive upload skipped: GOOGLE_DRIVE_FOLDER_ID is not configured.")
+        return drive_links
+
+    service = _google_drive_service()
+    if service is None:
+        return drive_links
+
+    out_dir = (ROOT / _session_output_dir(sid)).resolve()
+    html_files = _all_session_html_files_and_references(sid, out_dir)
+
+    uploaded = 0
+    for path in html_files:
+        link, file_id = _upload_file_to_google_drive(path, sid, out_dir, service=service)
+        if not link:
+            continue
+        rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
+        keys = {
+            str(path.resolve()),
+            rel,
+            path.name,
+            path.as_posix(),
+            str(path),
+            (out_dir / rel).as_posix(),
+        }
+        for key in keys:
+            drive_links[key] = link
+            if file_id:
+                drive_file_ids[key] = file_id
+        uploaded += 1
+
+    state["drive_links"] = drive_links
+    state["drive_file_ids"] = drive_file_ids
+
+    # Second pass: now that every artifact has a Drive URL, update the uploaded
+    # HTML contents so internal EQ/SIM/report links also point to Drive.
+    rewritten = 0
+    for path in html_files:
+        rel = _zip_relative_path_for_session_file(path, out_dir).replace("\\", "/")
+        file_id = drive_file_ids.get(rel) or drive_file_ids.get(str(path.resolve())) or drive_file_ids.get(path.name)
+        if not file_id:
+            continue
+        rewritten_html = _html_content_with_drive_links(path, sid, out_dir, drive_links)
+        _update_drive_html_file(service, file_id, rewritten_html, _drive_safe_name(path, out_dir, sid))
+        rewritten += 1
+
+    state["drive_uploaded_once"] = True
+    if uploaded:
+        _append_log(f"Google Drive upload complete: {uploaded} HTML artifact(s), {rewritten} rewritten with Drive links.")
+    else:
+        _append_log("Google Drive upload finished, but no HTML artifacts were found/uploaded.")
+    return drive_links
+
+
+def _drive_link_for_html_reference(value: str, sid: str, out_dir: Path, drive_links: dict[str, str] | None = None) -> str:
+    if not value:
+        return ""
+    value_s = str(value).strip()
+    if value_s.startswith("https://drive.google.com/") or value_s.startswith("http://drive.google.com/"):
+        return value_s
+    drive_links = drive_links if drive_links is not None else dict(_state(sid).get("drive_links") or {})
+    ref = _extract_first_html_reference(value_s) or value_s
+    if not ref:
+        return ""
+    local = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
+    local = _normalize_zip_artifact_path(local, out_dir).replace("\\", "/")
+    candidates = [
+        str(value).strip(),
+        ref.strip(),
+        local,
+        Path(local).name,
+        str((out_dir / local).resolve()),
+        (out_dir / local).as_posix(),
+    ]
+    for key in candidates:
+        if key in drive_links:
+            return drive_links[key]
+    return ""
+
+
+def _replace_html_references_with_drive_links(row: dict[str, Any], sid: str, out_dir: Path, drive_links: dict[str, str]) -> dict[str, Any]:
+    """Replace HTML path values in a CSV row with stable Google Drive links."""
+    out = dict(row)
+    html_link_values: list[str] = []
+    for key, value in list(out.items()):
+        text = str(value or "")
+        if ".html" not in text.lower():
+            continue
+        drive_link = _drive_link_for_html_reference(text, sid, out_dir, drive_links)
+        if drive_link:
+            out[key] = drive_link
+            html_link_values.append(drive_link)
+    if html_link_values:
+        out["launcher_drive_html_links"] = " | ".join(dict.fromkeys(html_link_values))
+    return out
+
+
+def _rewrite_session_csv_with_drive_links(session_csv: Path, sid: str, out_dir: Path, drive_links: dict[str, str]) -> tuple[list[str], list[dict[str, str]]]:
+    fieldnames, rows = _read_csv_rows(session_csv)
+    if not fieldnames or not rows or not drive_links:
+        return fieldnames, rows
+    new_rows = [_replace_html_references_with_drive_links(row, sid, out_dir, drive_links) for row in rows]
+    new_fields = list(fieldnames)
+    if any(row.get("launcher_drive_html_links") for row in new_rows) and "launcher_drive_html_links" not in new_fields:
+        new_fields.append("launcher_drive_html_links")
+    try:
+        session_csv.parent.mkdir(parents=True, exist_ok=True)
+        with session_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=new_fields, extrasaction="ignore")
+            writer.writeheader()
+            for row in new_rows:
+                writer.writerow({k: row.get(k, "") for k in new_fields})
+    except Exception as exc:
+        _append_log(f"Session CSV Drive-link rewrite failed: {type(exc).__name__}: {exc}")
+    return new_fields, [{k: str(row.get(k, "")) for k in new_fields} for row in new_rows]
 
 def _latest_cost_value_from_logs(text: str) -> float:
     metrics = _latest_token_metrics_from_logs(text)
@@ -640,11 +761,12 @@ def _finalize_run_outputs(sid: str) -> None:
     session_csv = _csv_path_for_session(sid)
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
 
-    drive_links, drive_folder_url = _upload_session_html_to_drive(sid)
-    state["drive_links"] = drive_links
-    state["drive_session_folder_url"] = drive_folder_url
-
-    fieldnames, rows = _rewrite_session_csv_file_with_drive_links(session_csv, sid, out_dir, drive_links)
+    # Upload HTML artifacts first, then rewrite CSV rows so every HTML reference
+    # points to a stable Google Drive link instead of Render/file:///Temp paths.
+    drive_links = _ensure_drive_artifacts_uploaded(sid)
+    fieldnames, rows = _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+    if not fieldnames or not rows:
+        fieldnames, rows = _read_csv_rows(session_csv)
 
     enriched_rows: list[dict[str, Any]] = []
     if rows and fieldnames:
@@ -654,8 +776,7 @@ def _finalize_run_outputs(sid: str) -> None:
             "launcher_ended_at_utc",
             "launcher_auto_key_used",
             "launcher_final_cost_usd",
-            "launcher_drive_folder_url",
-            "launcher_drive_html_files",
+            "launcher_drive_folder_id",
         ]
         merged_fields = list(fieldnames)
         for col in extra_fields:
@@ -663,16 +784,17 @@ def _finalize_run_outputs(sid: str) -> None:
                 merged_fields.append(col)
         cost = _latest_cost_value_from_logs(text)
         for row in rows:
-            out = dict(row)
+            out = _replace_html_references_with_drive_links(dict(row), sid, out_dir, drive_links)
             out.update({
                 "launcher_session_id": sid,
                 "launcher_result": result,
                 "launcher_ended_at_utc": ended_at,
                 "launcher_auto_key_used": "1" if state.get("auto_key_used") else "0",
                 "launcher_final_cost_usd": f"{cost:.8f}",
-                "launcher_drive_folder_url": drive_folder_url,
-                "launcher_drive_html_files": str(len(drive_links)),
+                "launcher_drive_folder_id": os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "").strip(),
             })
+            if out.get("launcher_drive_html_links") and "launcher_drive_html_links" not in merged_fields:
+                merged_fields.append("launcher_drive_html_links")
             enriched_rows.append(out)
         _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
         _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
@@ -692,7 +814,6 @@ def _finalize_run_outputs(sid: str) -> None:
         }
         _append_rows_to_csv(AUTO_KEY_DAILY_COSTS_CSV, cost_fields, [cost_row])
         _append_rows_to_google_sheet("auto_key_daily_costs", cost_fields, [cost_row])
-
 
 def _session_html_files(sid: str) -> list[Path]:
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
@@ -863,36 +984,47 @@ def _extract_first_html_reference(value: str) -> str:
 
 
 def _make_clickable_csv_value(value: str, sid: str, out_dir: Path) -> str:
-    """Make HTML artifact paths clickable when results.csv is opened in Sheets/Excel.
+    """Make Drive links clickable in downloaded results.csv.
 
-    The CSV stores ZIP-local paths, not Render/file:// temporary paths.
-    Existing =HYPERLINK(...) formulas are decoded and rebuilt so the link points
-    to the local file inside the downloaded ZIP.
+    The downloaded CSV should not point to ZIP-local HTML files. HTML artifacts
+    live in Google Drive, so any HTML reference is converted to a Drive URL
+    formula when a Drive link is available.
     """
-    original = str(value or "")
-    if "drive.google.com" in original:
-        return original
+    original = str(value or "").strip()
+    if not original:
+        return ""
+
+    if original.startswith("https://drive.google.com/") or original.startswith("http://drive.google.com/"):
+        safe_url = original.replace('"', '""')
+        return f'=HYPERLINK("{safe_url}","Open HTML")'
+
     ref = _extract_first_html_reference(original)
     if ref:
-        localized = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
-        localized = _normalize_zip_artifact_path(localized, out_dir).replace("\\", "/")
-        if localized.endswith(".html"):
-            safe_url = localized.replace('"', '""')
-            safe_label = localized.replace('"', '""')
-            return f'=HYPERLINK("{safe_url}","{safe_label}")'
+        drive_link = _drive_link_for_html_reference(ref, sid, out_dir, dict(_state(sid).get("drive_links") or {}))
+        if drive_link:
+            safe_url = drive_link.replace('"', '""')
+            return f'=HYPERLINK("{safe_url}","Open HTML")'
+
     return _localize_path_for_results_zip(original, sid, out_dir)
+
 
 def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Path) -> str:
     if not session_csv.exists():
         return ""
+
+    drive_links = dict(_state(sid).get("drive_links") or {})
+    if drive_links:
+        _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+
     raw = session_csv.read_text(encoding="utf-8-sig", errors="replace")
     try:
-        rows = list(csv.DictReader(raw.splitlines()))
-        fieldnames = csv.DictReader(raw.splitlines()).fieldnames
+        reader = csv.DictReader(raw.splitlines())
+        rows = list(reader)
+        fieldnames = reader.fieldnames or []
         if not fieldnames:
             return raw
-        import io
-        buf = io.StringIO()
+        import io as _io
+        buf = _io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
@@ -903,15 +1035,18 @@ def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Pa
 
 
 def _results_html_table_for_zip(session_csv: Path, sid: str, out_dir: Path) -> str:
-    """Create a clickable HTML table with a reliable Open HTML column.
+    """Create a clickable HTML results table.
 
-    The Open HTML links are embedded data URLs. This is intentional: Windows may
-    open each file from a ZIP in a different Temp folder, so normal file:/// or
-    relative links can break. Embedded links keep the table independent of the
-    temporary extraction directory.
+    The downloaded ZIP contains only this table, results.csv, and graphs.
+    All artifact links in the table point to Google Drive.
     """
     if not session_csv.exists():
         return "<!DOCTYPE html><html><body><p>No results.csv found.</p></body></html>"
+
+    drive_links = dict(_state(sid).get("drive_links") or {})
+    if drive_links:
+        _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+
     raw = session_csv.read_text(encoding="utf-8-sig", errors="replace")
     try:
         reader = csv.DictReader(raw.splitlines())
@@ -920,47 +1055,37 @@ def _results_html_table_for_zip(session_csv: Path, sid: str, out_dir: Path) -> s
     except Exception:
         rows, fieldnames = [], []
 
-    embed_cache: dict[str, str] = {}
-
-    def embedded_href_for(ref: str) -> str:
-        local = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
-        local = _normalize_zip_artifact_path(local, out_dir).replace("\\", "/")
-        target = (out_dir / local).resolve()
-        try:
-            target.relative_to(out_dir)
-        except Exception:
-            return html_lib.escape(local, quote=True)
-        if not target.exists() or target.suffix.lower() != ".html":
-            return html_lib.escape(local, quote=True)
-        if local not in embed_cache:
-            html_text = _localized_html_content_for_zip(
-                target, sid, out_dir, embed_html_links=True, depth=0, max_depth=8
-            )
-            embed_cache[local] = "data:text/html;charset=utf-8;base64," + base64.b64encode(
-                html_text.encode("utf-8", errors="replace")
-            ).decode("ascii")
-        return embed_cache[local]
+    def drive_href_for_value(value: object) -> str:
+        text_value = str(value or "").strip()
+        if text_value.startswith("https://drive.google.com/") or text_value.startswith("http://drive.google.com/"):
+            return text_value
+        ref = _extract_first_html_reference(text_value)
+        if ref:
+            return _drive_link_for_html_reference(ref, sid, out_dir, drive_links)
+        return ""
 
     def display_value(value: object) -> str:
-        return html_lib.escape(_localize_path_for_results_zip(str(value or ""), sid, out_dir), quote=True)
+        return html_lib.escape(str(value or ""), quote=True)
 
     def open_html_cell(row: dict[str, Any]) -> str:
-        candidates = [
-            row.get("conversation_link", ""),
-            row.get("html_link", ""),
-            row.get("visual_game_display", ""),
-            row.get("game_display", ""),
+        preferred = [
+            "launcher_drive_html_links",
+            "conversation_link",
+            "html_link",
+            "visual_game_display",
+            "game_display",
+            "full_report",
+            "report_path",
         ]
-        for value in candidates + list(row.values()):
-            ref = _extract_first_html_reference(str(value or ""))
-            if ref:
-                local = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
-                local = _normalize_zip_artifact_path(local, out_dir).replace("\\", "/")
-                if local.endswith(".html"):
-                    href = embedded_href_for(local)
-                    label = html_lib.escape(local, quote=True)
-                    return f'<a href="{html_lib.escape(href, quote=True)}" target="_blank" rel="noopener">Open HTML</a><div class="path">{label}</div>'
-        return ""
+        for key in preferred:
+            href = drive_href_for_value(row.get(key, ""))
+            if href:
+                return f'<a href="{html_lib.escape(href, quote=True)}" target="_blank" rel="noopener">Open HTML</a>'
+        for value in row.values():
+            href = drive_href_for_value(value)
+            if href:
+                return f'<a href="{html_lib.escape(href, quote=True)}" target="_blank" rel="noopener">Open HTML</a>'
+        return '<span class="missing">No Drive HTML link</span>'
 
     shown_fields = ["Open HTML"] + fieldnames
     head = "".join(f"<th>{html_lib.escape(str(h), quote=True)}</th>" for h in shown_fields)
@@ -968,16 +1093,11 @@ def _results_html_table_for_zip(session_csv: Path, sid: str, out_dir: Path) -> s
     for row in rows:
         cells = [f"<td>{open_html_cell(row)}</td>"]
         for h in fieldnames:
-            ref = _extract_first_html_reference(str(row.get(h, "")))
-            if ref:
-                local = _zip_path_from_server_path(ref, sid, out_dir).replace("\\", "/")
-                local = _normalize_zip_artifact_path(local, out_dir).replace("\\", "/")
-                if local.endswith(".html"):
-                    href = embedded_href_for(local)
-                    label = html_lib.escape(local, quote=True)
-                    cells.append(f'<td><a href="{html_lib.escape(href, quote=True)}" target="_blank" rel="noopener">{label}</a></td>')
-                    continue
-            cells.append(f"<td>{display_value(row.get(h, ''))}</td>")
+            href = drive_href_for_value(row.get(h, ""))
+            if href:
+                cells.append(f'<td><a href="{html_lib.escape(href, quote=True)}" target="_blank" rel="noopener">Open HTML</a></td>')
+            else:
+                cells.append(f"<td>{display_value(row.get(h, ''))}</td>")
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
     return f"""<!DOCTYPE html>
@@ -993,18 +1113,19 @@ table{{border-collapse:collapse;width:100%;background:white;border:1px solid #d0
 th,td{{border:1px solid #d0d5dd;padding:8px 10px;font-size:12px;text-align:left;vertical-align:top;max-width:360px;word-break:break-word}}
 th{{background:#eef2f7;font-weight:800;position:sticky;top:0}}
 a{{color:#2563eb;text-decoration:underline;font-weight:700}}
-.path{{font-size:11px;color:#667085;margin-top:4px}}
+.missing{{color:#b42318;font-weight:700}}
 </style>
 </head>
 <body>
 <h1>Automata Run Results</h1>
-<p>Use the <b>Open HTML</b> column. The links are embedded so they do not depend on Windows ZIP Temp folders.</p>
+<p>The ZIP contains only the results tables and generated graphs. HTML artifacts are saved in Google Drive, and links in this table point to Drive.</p>
 <table>
 <thead><tr>{head}</tr></thead>
 <tbody>{''.join(body_rows)}</tbody>
 </table>
 </body>
 </html>"""
+
 
 def _localized_html_content_for_zip(
     path: Path,
@@ -1077,7 +1198,7 @@ def _localized_html_content_for_zip(
         raw = html_lib.unescape(str(raw or "").strip())
         if not raw:
             return raw
-        if raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:") or raw.startswith("data:") or "drive.google.com" in raw:
+        if raw.startswith("#") or raw.startswith("mailto:") or raw.startswith("javascript:") or raw.startswith("data:"):
             return raw
         anchor = ""
         if "#" in raw and not raw.startswith("#"):
@@ -1190,31 +1311,41 @@ def _run_graph_generation_for_zip(session_csv: Path, sid: str, out_dir: Path) ->
 
 
 def _make_results_zip(sid: str) -> Path:
+    """Create a user download ZIP.
+
+    By design, the ZIP does NOT include HTML artifacts. HTML files are uploaded
+    to Google Drive and every table link points to Drive. The ZIP contains only:
+      - results.csv
+      - results.html
+      - graphs.pdf, when graph generation succeeds
+    """
     state = _state(sid)
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     zip_path = out_dir / f"session_results_{sid}.zip"
     session_csv = _csv_path_for_session(sid)
+
+    # Re-run upload/link rewrite before download. This makes the button robust
+    # even if the run ended before Drive was configured or finalize had failed.
+    drive_links = _ensure_drive_artifacts_uploaded(sid, force=not bool(_state(sid).get("drive_links")))
+    if drive_links:
+        _rewrite_session_csv_with_drive_links(session_csv, sid, out_dir, drive_links)
+
     graph_pdf, graph_log = _run_graph_generation_for_zip(session_csv, sid, out_dir)
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         if session_csv.exists():
             zf.writestr("results.csv", _localized_results_csv_text_for_zip(session_csv, sid, out_dir))
             zf.writestr("results.html", _results_html_table_for_zip(session_csv, sid, out_dir))
-        for html_path in _session_html_files(sid):
-            if html_path == zip_path:
-                continue
-            arcname = _zip_relative_path_for_session_file(html_path, out_dir)
-            try:
-                zf.writestr(arcname, _localized_html_content_for_zip(html_path, sid, out_dir))
-            except Exception:
-                zf.write(html_path, arcname=arcname)
+        else:
+            zf.writestr("results.csv", "")
+            zf.writestr("results.html", "<!DOCTYPE html><html><body><p>No results.csv found.</p></body></html>")
+
         if graph_pdf and graph_pdf.exists():
             zf.write(graph_pdf, arcname="graphs.pdf")
-        zf.writestr("graph_generation_log.txt", graph_log or "")
-        log_path = out_dir / "launcher_logs.txt"
-        log_path.write_text("\n".join(state.get("logs", [])), encoding="utf-8")
-        zf.write(log_path, arcname="launcher_logs.txt")
+        elif graph_log:
+            zf.writestr("graph_generation_log.txt", graph_log)
+
     return zip_path
 
 
@@ -2943,6 +3074,11 @@ def run():
 
     state["auto_key_used"] = False
     state["finalized_once"] = False
+    state["drive_uploaded_once"] = False
+    state["drive_links"] = {}
+    state["drive_file_ids"] = {}
+    state["drive_run_folder_id"] = ""
+    state["drive_run_folder_link"] = ""
     if _is_flash_lite_model(form.get("api_provider", ""), form.get("model_name", "")) and not form.get("api_key", "").strip():
         server_google_key = os.environ.get("GOOGLE_API_KEY", "").strip()
         if server_google_key:
