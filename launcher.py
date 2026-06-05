@@ -83,8 +83,6 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
         "finalized_once": False,
-        "run_started_at": 0.0,
-        "run_html_snapshot": [],
     }
 
 
@@ -836,7 +834,6 @@ def _run_command(cmd: list[str], sid: str) -> None:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
     state["current_full_report_path"] = ""
     state["cached_full_report_path"] = ""
-    state["cached_full_report_source_path"] = ""
     _append_log("Launcher started.")
 
     safe_cmd = []
@@ -1129,15 +1126,18 @@ def _latest_token_metrics_from_logs(text: str) -> dict[str, Any]:
 
 
 def _server_cached_html_path(source_path: str, sid: str) -> str:
-    """Copy the final report HTML to a temporary server-side cache and return that path.
+    """Copy the current run's final report HTML to a server-side cache.
 
-    This keeps the analysis iframe available even when the original generated
-    artifact path is later moved, localized for ZIP export, or cleaned up.
+    Important bug fix: the cache must be tied to the source HTML path. The old
+    version returned the first cached HTML if it existed, even when a newer
+    source_path was already found. That is why the launcher kept showing the
+    previous run's analysis. Now the cache is reused only when it was created
+    from the same source file; otherwise it is replaced with the newest report.
     """
     if not source_path:
         return ""
 
-    raw = source_path.strip()
+    raw = str(source_path).strip()
     if raw.startswith("file:///"):
         raw = raw[8:]
     elif raw.startswith("file://"):
@@ -1151,31 +1151,30 @@ def _server_cached_html_path(source_path: str, sid: str) -> str:
     state = _state(sid)
     cached = str(state.get("cached_full_report_path") or "").strip()
     cached_source = str(state.get("cached_full_report_source_path") or "").strip()
-    src_key = str(src)
-    if cached and cached_source == src_key and Path(cached).exists():
-        return cached
 
     if not src.exists() or not src.is_file():
-        if cached and not Path(cached).exists():
+        # Do not silently fall back to an old cached report for a new source.
+        if cached_source and cached_source != str(src):
             state["cached_full_report_path"] = ""
             state["cached_full_report_source_path"] = ""
         return ""
 
+    if cached and cached_source == str(src) and Path(cached).exists():
+        return cached
+
     try:
         cache_dir = ROOT / "runs" / "server_html_cache" / sid
         cache_dir.mkdir(parents=True, exist_ok=True)
-        dst = cache_dir / src.name
-        if cached and Path(cached).exists() and Path(cached).resolve() != dst.resolve():
-            try:
-                Path(cached).unlink()
-            except Exception:
-                pass
+        # Keep a stable current file, but replace it whenever the source changes.
+        dst = cache_dir / "current_full_report.html"
         shutil.copy2(src, dst)
         state["cached_full_report_path"] = str(dst)
-        state["cached_full_report_source_path"] = src_key
+        state["cached_full_report_source_path"] = str(src)
         return str(dst)
     except Exception as exc:
         _append_log(f"Launcher HTML cache error: {type(exc).__name__}: {exc}")
+        state["cached_full_report_path"] = str(src)
+        state["cached_full_report_source_path"] = str(src)
         return str(src)
 
 def _path_to_url(path: str | None, view: str = "full") -> str:
@@ -1644,35 +1643,6 @@ def _first_comparison_path() -> str:
     return ""
 
 
-
-def _current_session_html_snapshot(sid: str) -> set[str]:
-    """Return the session HTML files that already exist before a run starts.
-
-    This is more reliable than mtime filtering because some generated/copied
-    artifacts may preserve an old timestamp. We use it to avoid showing the
-    previous game's report at the beginning of a new run, while still allowing
-    the current report to appear as soon as it is created.
-    """
-    out_dir = (ROOT / _session_output_dir(sid)).resolve()
-    candidates: list[Path] = []
-    try:
-        html_dir = out_dir / "html"
-        if html_dir.exists():
-            candidates.extend(html_dir.glob("session_*.html"))
-        if out_dir.exists():
-            candidates.extend(out_dir.rglob("session_*.html"))
-    except Exception:
-        return set()
-
-    snapshot: set[str] = set()
-    for candidate in candidates:
-        try:
-            if candidate.exists() and candidate.is_file():
-                snapshot.add(str(candidate.resolve()))
-        except Exception:
-            continue
-    return snapshot
-
 def _latest_game_display_path() -> str:
     text = "\n".join(logs)
     patterns = [
@@ -1698,28 +1668,7 @@ def _latest_game_display_path() -> str:
         if html_dir.exists():
             candidates.extend(html_dir.glob("session_*.html"))
         candidates.extend(out_dir.rglob("session_*.html"))
-        state = _state(sid)
-        snapshot = set(str(x) for x in (state.get("run_html_snapshot") or []))
-        result = _run_result()
-
-        resolved_candidates = []
-        for candidate in {p.resolve() for p in candidates if p.exists() and p.is_file()}:
-            try:
-                candidate_key = str(candidate.resolve())
-                if candidate_key in snapshot:
-                    continue
-                resolved_candidates.append(candidate)
-            except Exception:
-                continue
-
-        # During a run we must never fall back to an old report. After the run
-        # ends, if no new file can be distinguished from the snapshot, use the
-        # newest report in this browser session as a last resort so the first
-        # completed game still gets an analysis iframe.
-        if not resolved_candidates and result in {"won", "lost", "crashed", "stopped"}:
-            resolved_candidates = [p.resolve() for p in candidates if p.exists() and p.is_file()]
-
-        candidates = sorted({p for p in resolved_candidates}, key=lambda x: x.stat().st_mtime)
+        candidates = sorted({p.resolve() for p in candidates if p.exists() and p.is_file()}, key=lambda x: x.stat().st_mtime)
         if candidates:
             return str(candidates[-1])
     except Exception:
@@ -1785,7 +1734,7 @@ button.analysis-btn{background:#7c3aed}
 .status-won{background:var(--win)!important;color:#166534!important}
 .status-lost,.status-crashed{background:var(--lose)!important;color:#991b1b!important}
 .mini-frame{width:100%;height:300px;border:1px solid var(--line);border-radius:12px;background:white;display:block;margin:10px auto 0;overflow:hidden}
-.full-frame{width:100%;height:86vh;border:1px solid var(--line);border-radius:16px;background:white}
+.full-frame{width:100%;height:82vh;border:1px solid var(--line);border-radius:16px;background:white}
 .dfa-legend{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0 10px;font-size:12px;color:#344054;text-align:left}
 .legend-item{display:flex;align-items:center;gap:6px;white-space:nowrap}
 .legend-dot{width:12px;height:12px;border-radius:50%;border:1px solid #101828;display:inline-block}
@@ -2472,8 +2421,6 @@ def run():
 
     state["auto_key_used"] = False
     state["finalized_once"] = False
-    state["run_started_at"] = datetime.now(timezone.utc).timestamp()
-    state["run_html_snapshot"] = sorted(_current_session_html_snapshot(sid))
     if _is_flash_lite_model(form.get("api_provider", ""), form.get("model_name", "")) and not form.get("api_key", "").strip():
         server_google_key = os.environ.get("GOOGLE_API_KEY", "").strip()
         if server_google_key:
@@ -2484,9 +2431,9 @@ def run():
         return "API key is required for this model. The server GOOGLE_API_KEY is used only for gemini-3.1-flash-lite-preview.", 400
 
     state["current_full_report_path"] = ""
+    state["current_target_path"] = ""
     state["cached_full_report_path"] = ""
     state["cached_full_report_source_path"] = ""
-    state["current_target_path"] = ""
     state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
 
@@ -2548,8 +2495,6 @@ def stop():
     state["running"] = False
     state["process"] = None
     state["current_full_report_path"] = ""
-    state["cached_full_report_path"] = ""
-    state["cached_full_report_source_path"] = ""
     state["current_target_path"] = ""
     return "ok"
 
@@ -2568,7 +2513,7 @@ def get_events():
     events = _events_from_logs()
     result = _run_result()
 
-    report_url = url_for("analysis_artifact_route") if cached_game_path else ""
+    report_url = url_for("analysis_artifact_route") if (cached_game_path or result in {"won", "lost", "crashed", "stopped"}) else ""
 
     return jsonify({
         "running": state["running"],
@@ -2659,11 +2604,11 @@ window.addEventListener('load', () => {{
 </html>"""
 
 
-def _zoomed_full_report_document(content: str, scale: float = 0.55) -> str:
+def _zoomed_full_report_document(content: str, scale: float = 0.60) -> str:
     """Serve the full analysis HTML in a wide virtual page and scale it down."""
     escaped = html_lib.escape(content, quote=True)
-    virtual_w = 2200
-    virtual_h = 3200
+    virtual_w = 1600
+    virtual_h = 2600
     scaled_h = int(virtual_h * scale)
     return f"""<!DOCTYPE html>
 <html>
@@ -2814,10 +2759,10 @@ def _html_artifact_response_for_path(path: str, view: str) -> Response:
         base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
         if "<base " not in content.lower():
             if re.search(r"<head[^>]*>", content, flags=re.IGNORECASE):
-                content = re.sub(r"(<head[^>]*>)", r"" + base_tag, content, count=1, flags=re.IGNORECASE)
+                content = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + base_tag, content, count=1, flags=re.IGNORECASE)
             else:
                 content = base_tag + content
-        content = _zoomed_full_report_document(content, scale=0.55)
+        content = _zoomed_full_report_document(content, scale=0.60)
 
     return Response(content, mimetype="text/html; charset=utf-8")
 
