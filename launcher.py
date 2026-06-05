@@ -78,7 +78,6 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "current_target_path": "",
         "current_full_report_path": "",
         "cached_full_report_path": "",
-        "cached_full_report_source_path": "",
         "last_form": form,
         "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
@@ -1126,18 +1125,15 @@ def _latest_token_metrics_from_logs(text: str) -> dict[str, Any]:
 
 
 def _server_cached_html_path(source_path: str, sid: str) -> str:
-    """Copy the current run's final report HTML to a server-side cache.
+    """Copy the final report HTML to a temporary server-side cache and return that path.
 
-    Important bug fix: the cache must be tied to the source HTML path. The old
-    version returned the first cached HTML if it existed, even when a newer
-    source_path was already found. That is why the launcher kept showing the
-    previous run's analysis. Now the cache is reused only when it was created
-    from the same source file; otherwise it is replaced with the newest report.
+    This keeps the analysis iframe available even when the original generated
+    artifact path is later moved, localized for ZIP export, or cleaned up.
     """
     if not source_path:
         return ""
 
-    raw = str(source_path).strip()
+    raw = source_path.strip()
     if raw.startswith("file:///"):
         raw = raw[8:]
     elif raw.startswith("file://"):
@@ -1150,31 +1146,23 @@ def _server_cached_html_path(source_path: str, sid: str) -> str:
 
     state = _state(sid)
     cached = str(state.get("cached_full_report_path") or "").strip()
-    cached_source = str(state.get("cached_full_report_source_path") or "").strip()
+    if cached and Path(cached).exists():
+        return cached
 
     if not src.exists() or not src.is_file():
-        # Do not silently fall back to an old cached report for a new source.
-        if cached_source and cached_source != str(src):
+        if cached and not Path(cached).exists():
             state["cached_full_report_path"] = ""
-            state["cached_full_report_source_path"] = ""
         return ""
-
-    if cached and cached_source == str(src) and Path(cached).exists():
-        return cached
 
     try:
         cache_dir = ROOT / "runs" / "server_html_cache" / sid
         cache_dir.mkdir(parents=True, exist_ok=True)
-        # Keep a stable current file, but replace it whenever the source changes.
-        dst = cache_dir / "current_full_report.html"
+        dst = cache_dir / src.name
         shutil.copy2(src, dst)
         state["cached_full_report_path"] = str(dst)
-        state["cached_full_report_source_path"] = str(src)
         return str(dst)
     except Exception as exc:
         _append_log(f"Launcher HTML cache error: {type(exc).__name__}: {exc}")
-        state["cached_full_report_path"] = str(src)
-        state["cached_full_report_source_path"] = str(src)
         return str(src)
 
 def _path_to_url(path: str | None, view: str = "full") -> str:
@@ -2432,8 +2420,6 @@ def run():
 
     state["current_full_report_path"] = ""
     state["current_target_path"] = ""
-    state["cached_full_report_path"] = ""
-    state["cached_full_report_source_path"] = ""
     state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
 
@@ -2604,7 +2590,7 @@ window.addEventListener('load', () => {{
 </html>"""
 
 
-def _zoomed_full_report_document(content: str, scale: float = 0.60) -> str:
+def _zoomed_full_report_document(content: str, scale: float = 0.72) -> str:
     """Serve the full analysis HTML in a wide virtual page and scale it down."""
     escaped = html_lib.escape(content, quote=True)
     virtual_w = 1600
@@ -2759,10 +2745,10 @@ def _html_artifact_response_for_path(path: str, view: str) -> Response:
         base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
         if "<base " not in content.lower():
             if re.search(r"<head[^>]*>", content, flags=re.IGNORECASE):
-                content = re.sub(r"(<head[^>]*>)", lambda m: m.group(1) + base_tag, content, count=1, flags=re.IGNORECASE)
+                content = re.sub(r"(<head[^>]*>)", r"" + base_tag, content, count=1, flags=re.IGNORECASE)
             else:
                 content = base_tag + content
-        content = _zoomed_full_report_document(content, scale=0.60)
+        content = _zoomed_full_report_document(content, scale=0.72)
 
     return Response(content, mimetype="text/html; charset=utf-8")
 
