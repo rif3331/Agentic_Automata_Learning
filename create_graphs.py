@@ -638,7 +638,11 @@ def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_lab
 
     x = np.arange(len(x_order), dtype=float)
     n_models = max(len(model_order), 1)
-    bar_width = min(0.11, BAR_GROUP_WIDTH / n_models)
+    fig.canvas.draw()
+    axis_px = max(float(ax.bbox.width), 1.0)
+    data_span = max(float(len(x_order)), 1.0)
+    max_bar_width_data = (30.0 * data_span / axis_px) / 0.92
+    bar_width = min(0.11, BAR_GROUP_WIDTH / n_models, max_bar_width_data)
     offsets = (np.arange(n_models) - (n_models - 1) / 2) * bar_width
 
     hover_artists = []
@@ -1782,11 +1786,15 @@ def main(csv_path, output_pdf_path=PDF_OUTPUT_PATH):
         agg_ttt,
     )
 
-    fig_similarity, _ = draw_similarity_line_graph(
+    fig_similarity, _ = draw_grouped_bar_graph(
         agg_similarity,
         model_order,
         model_colors,
         x_order,
+        SIMILARITY_GRAPH_TITLE,
+        SIMILARITY_Y_LABEL,
+        SIMILARITY_Y_MAX,
+        value_multiplier=100.0,
     )
 
     extra_figures = []

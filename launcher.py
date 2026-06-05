@@ -1645,11 +1645,18 @@ def _latest_game_display_path() -> str:
 
     # Robust fallback: when the log line is missing or was printed in a slightly
     # different format, use the newest session HTML generated under this
-    # browser session's output directory.
+    # browser session's output directory. Search recursively because some
+    # deployments create/copy the final report slightly later or in a nested
+    # html directory.
     try:
         sid = _get_sid()
         out_dir = (ROOT / _session_output_dir(sid)).resolve()
-        candidates = sorted((out_dir / "html").glob("session_*.html"), key=lambda x: x.stat().st_mtime)
+        candidates = []
+        html_dir = out_dir / "html"
+        if html_dir.exists():
+            candidates.extend(html_dir.glob("session_*.html"))
+        candidates.extend(out_dir.rglob("session_*.html"))
+        candidates = sorted({p.resolve() for p in candidates if p.exists() and p.is_file()}, key=lambda x: x.stat().st_mtime)
         if candidates:
             return str(candidates[-1])
     except Exception:
@@ -2582,6 +2589,67 @@ window.addEventListener('load', () => {{
 </body>
 </html>"""
 
+
+def _zoomed_full_report_document(content: str, scale: float = 0.72) -> str:
+    """Serve the full analysis HTML in a wide virtual page and scale it down."""
+    escaped = html_lib.escape(content, quote=True)
+    virtual_w = 1600
+    virtual_h = 2600
+    scaled_h = int(virtual_h * scale)
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset=\"utf-8\">
+<style>
+  html, body {{ margin:0; padding:0; width:100%; min-height:100%; overflow:auto; background:#ffffff; font-family:Arial, sans-serif; }}
+  #viewport {{ width:100%; min-height:{scaled_h}px; overflow:auto; background:#ffffff; }}
+  #stage {{ width:{virtual_w}px; min-height:{virtual_h}px; transform:scale({scale}); transform-origin:top left; background:#ffffff; }}
+  #inner {{ width:{virtual_w}px; height:{virtual_h}px; border:0; display:block; background:#ffffff; }}
+</style>
+<script>
+function resizeInner() {{
+  try {{
+    const frame = document.getElementById('inner');
+    const doc = frame.contentDocument || frame.contentWindow.document;
+    const h = Math.max(1600, doc.documentElement ? doc.documentElement.scrollHeight : 0, doc.body ? doc.body.scrollHeight : 0);
+    frame.style.height = h + 'px';
+    document.getElementById('stage').style.minHeight = h + 'px';
+    document.getElementById('viewport').style.minHeight = Math.ceil(h * {scale}) + 'px';
+  }} catch(e) {{}}
+}}
+window.addEventListener('load', () => {{
+  const frame = document.getElementById('inner');
+  frame.addEventListener('load', () => {{
+    resizeInner();
+    setTimeout(resizeInner, 100);
+    setTimeout(resizeInner, 500);
+    setTimeout(resizeInner, 1500);
+  }});
+  resizeInner();
+}});
+</script>
+</head>
+<body>
+<div id=\"viewport\"><div id=\"stage\"><iframe id=\"inner\" srcdoc=\"{escaped}\"></iframe></div></div>
+</body>
+</html>"""
+
+
+def _analysis_waiting_document() -> str:
+    return """<!doctype html>
+<html>
+<head>
+<meta charset=\"utf-8\">
+<style>
+body{font-family:Arial,sans-serif;padding:24px;color:#344054;background:#fff}
+.dots span{animation:blink 1.2s infinite;font-weight:900;font-size:22px}.dots span:nth-child(2){animation-delay:.2s}.dots span:nth-child(3){animation-delay:.4s}
+@keyframes blink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+</style>
+<script>setTimeout(() => window.location.reload(), 1000);</script>
+</head>
+<body>Analysis HTML is not available yet<span class=\"dots\"><span>.</span><span>.</span><span>.</span></span></body>
+</html>"""
+
 @app.get("/lib/<path:filename>")
 def serve_pyvis_lib(filename):
     """Serve local PyVis/vis-network helper files referenced by generated DFA HTML.
@@ -2670,16 +2738,17 @@ def _html_artifact_response_for_path(path: str, view: str) -> Response:
         content = _zoomed_html_document(content, scale=0.30)
 
     elif view == "full":
-        # Keep the report itself as the iframe document. Do not wrap it in an
-        # additional iframe/srcdoc. Add a base only for relative non-embedded
-        # links, while the session HTML remains fully visible.
+        # Add a base for relative links, then render the report in a wide
+        # virtual viewport and zoom it out. This prevents the analysis layout
+        # from collapsing/overlapping inside the launcher iframe.
         base_href = request.url_root.rstrip("/") + "/"
         base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
         if "<base " not in content.lower():
             if re.search(r"<head[^>]*>", content, flags=re.IGNORECASE):
-                content = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, content, count=1, flags=re.IGNORECASE)
+                content = re.sub(r"(<head[^>]*>)", r"" + base_tag, content, count=1, flags=re.IGNORECASE)
             else:
                 content = base_tag + content
+        content = _zoomed_full_report_document(content, scale=0.72)
 
     return Response(content, mimetype="text/html; charset=utf-8")
 
@@ -2691,7 +2760,7 @@ def analysis_artifact_route():
     game_path = _latest_game_display_path()
     cached_game_path = _server_cached_html_path(game_path, sid) if game_path else str(state.get("cached_full_report_path") or "")
     if not cached_game_path:
-        return Response("<!doctype html><html><body style='font-family:Arial;padding:24px'>Analysis HTML is not available yet.</body></html>", mimetype="text/html; charset=utf-8")
+        return Response(_analysis_waiting_document(), mimetype="text/html; charset=utf-8")
     return _html_artifact_response_for_path(cached_game_path, "full")
 
 
