@@ -586,10 +586,6 @@ def _make_results_zip(sid: str) -> Path:
                 zf.write(html_path, arcname=arcname)
         if graph_pdf and graph_pdf.exists():
             zf.write(graph_pdf, arcname="graphs.pdf")
-        zf.writestr("graph_generation_log.txt", graph_log or "")
-        log_path = out_dir / "launcher_logs.txt"
-        log_path.write_text("\n".join(state.get("logs", [])), encoding="utf-8")
-        zf.write(log_path, arcname="launcher_logs.txt")
     return zip_path
 
 
@@ -1637,10 +1633,27 @@ def _first_comparison_path() -> str:
 
 def _latest_game_display_path() -> str:
     text = "\n".join(logs)
-    pattern = r'Visual game display:\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+\.html)'
-    matches = re.findall(pattern, text)
-    if matches:
-        return matches[-1].strip()
+    patterns = [
+        r'Visual game display:\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+\.html)',
+        r'(?:Game display|Full game analysis|Analysis HTML|HTML report):\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+\.html)',
+        r'(file:///[^\s"]*?/html/session_[^\s"]+?\.html|[A-Za-z]:[^\n]*?[/\\]html[/\\]session_[^\n]+?\.html|[^\s]+/html/session_[^\s]+?\.html)',
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].strip()
+
+    # Robust fallback: when the log line is missing or was printed in a slightly
+    # different format, use the newest session HTML generated under this
+    # browser session's output directory.
+    try:
+        sid = _get_sid()
+        out_dir = (ROOT / _session_output_dir(sid)).resolve()
+        candidates = sorted((out_dir / "html").glob("session_*.html"), key=lambda x: x.stat().st_mtime)
+        if candidates:
+            return str(candidates[-1])
+    except Exception:
+        pass
     return ""
 
 
@@ -2479,6 +2492,8 @@ def get_events():
     events = _events_from_logs()
     result = _run_result()
 
+    report_url = url_for("analysis_artifact_route") if (cached_game_path or result in {"won", "lost", "crashed", "stopped"}) else ""
+
     return jsonify({
         "running": state["running"],
         "result": result,
@@ -2487,7 +2502,7 @@ def get_events():
         "target_url": target_url,
         "budget_exhausted": budget_exhausted,
         "tool_request_started": _has_started_agent_tool_call(text),
-        "full_report_url": _path_to_url(cached_game_path, "full") if cached_game_path else "",
+        "full_report_url": report_url,
         "save_note": _result_save_note_from_logs(text),
         "token_metrics": _latest_token_metrics_from_logs(text),
     })
@@ -2591,87 +2606,103 @@ def serve_pyvis_lib(filename):
     return Response("Library asset not found", status=404)
 
 
-@app.get("/html_artifact")
-def html_artifact_route():
-    path = unquote(request.args.get("path", ""))
-    view = unquote(request.args.get("view", "full"))
-    try:
-        if path.startswith("file:///"):
-            path = path[8:]
-        elif path.startswith("file://"):
-            path = path[7:]
+def _resolve_html_artifact_path(path: str, sid: str | None = None) -> Path | None:
+    sid = sid or _get_sid()
+    raw = unquote(html_lib.unescape(str(path or "").strip()))
+    if raw.startswith("file:///"):
+        raw = raw[8:]
+    elif raw.startswith("file://"):
+        raw = raw[7:]
 
-        p = Path(path).resolve()
-        if not p.exists() or not p.is_file():
-            return Response("HTML artifact not found", status=404)
+    candidates: list[Path] = []
+    if raw:
+        try:
+            candidates.append(Path(raw).resolve())
+        except Exception:
+            pass
 
-        content = p.read_text(encoding="utf-8", errors="replace")
+    base = os.path.basename(raw.replace("\\", "/")) if raw else ""
+    search_roots = [
+        ROOT / "runs" / "server_html_cache" / sid,
+        ROOT / _session_output_dir(sid),
+    ]
+    for root in search_roots:
+        try:
+            if base:
+                candidates.extend(root.rglob(base))
+            else:
+                candidates.extend((root / "html").glob("session_*.html"))
+        except Exception:
+            pass
 
-        if view in {"candidate", "raw"}:
-            # HYPOTHESIS_DFA_LINK and TARGET_DFA_LINK usually point directly
-            # to standalone DFA HTML files. Wrap them so they appear zoomed out
-            # and centered inside the launcher iframe.
-            content = _zoomed_html_document(content, scale=0.30)
+    for c in candidates:
+        try:
+            c = c.resolve()
+            if c.exists() and c.is_file() and c.suffix.lower() == ".html":
+                return c
+        except Exception:
+            continue
+    return None
 
-        elif view == "target":
-            # Some older target links may point to comparison reports where the
-            # target/candidate DFA HTML is embedded in iframes.
-            matches = []
-            for m in re.finditer(
-                r"<iframe\b[^>]*\bsrcdoc=(['\"])(.*?)\1[^>]*>",
-                content,
-                flags=re.DOTALL | re.IGNORECASE,
-            ):
-                matches.append(m.group(2))
 
-            if matches:
-                content = html_lib.unescape(matches[0])
+def _html_artifact_response_for_path(path: str, view: str) -> Response:
+    p = _resolve_html_artifact_path(path)
+    if not p:
+        return Response("HTML artifact not found", status=404)
 
-            content = _zoomed_html_document(content, scale=0.30)
+    content = p.read_text(encoding="utf-8", errors="replace")
 
-        elif view == "full":
-            # Serve the saved analysis HTML itself, not a nested srcdoc iframe.
-            # Nesting the full report inside another srcdoc iframe can render as
-            # a blank white page in browsers when the report contains large
-            # embedded srcdoc DFA frames. The outer launcher already displays
-            # this route inside an iframe, so the report should be returned
-            # directly from the temporary server-side copy.
-            base_href = request.url_root.rstrip("/") + "/"
-            base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
+    if view in {"candidate", "raw"}:
+        content = _zoomed_html_document(content, scale=0.30)
+
+    elif view == "target":
+        matches = []
+        for m in re.finditer(
+            r"<iframe\b[^>]*\bsrcdoc=(['\"])(.*?)\1[^>]*>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            matches.append(m.group(2))
+
+        if matches:
+            content = html_lib.unescape(matches[0])
+
+        content = _zoomed_html_document(content, scale=0.30)
+
+    elif view == "full":
+        # Keep the report itself as the iframe document. Do not wrap it in an
+        # additional iframe/srcdoc. Add a base only for relative non-embedded
+        # links, while the session HTML remains fully visible.
+        base_href = request.url_root.rstrip("/") + "/"
+        base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
+        if "<base " not in content.lower():
             if re.search(r"<head[^>]*>", content, flags=re.IGNORECASE):
                 content = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, content, count=1, flags=re.IGNORECASE)
             else:
                 content = base_tag + content
 
-        return Response(content, mimetype="text/html; charset=utf-8")
+    return Response(content, mimetype="text/html; charset=utf-8")
+
+
+@app.get("/analysis_artifact")
+def analysis_artifact_route():
+    sid = _get_sid()
+    state = _state(sid)
+    game_path = _latest_game_display_path()
+    cached_game_path = _server_cached_html_path(game_path, sid) if game_path else str(state.get("cached_full_report_path") or "")
+    if not cached_game_path:
+        return Response("<!doctype html><html><body style='font-family:Arial;padding:24px'>Analysis HTML is not available yet.</body></html>", mimetype="text/html; charset=utf-8")
+    return _html_artifact_response_for_path(cached_game_path, "full")
+
+
+@app.get("/html_artifact")
+def html_artifact_route():
+    path = unquote(request.args.get("path", ""))
+    view = unquote(request.args.get("view", "full"))
+    try:
+        return _html_artifact_response_for_path(path, view)
     except Exception as exc:
         return Response(f"Failed to read artifact: {type(exc).__name__}: {exc}", status=500)
-
-
-@app.get("/local_file")
-def local_file_route():
-    path = unquote(request.args.get("path", ""))
-    try:
-        if path.startswith("file:///"):
-            path = path[8:]
-        elif path.startswith("file://"):
-            path = path[7:]
-
-        p = Path(path).resolve()
-        if not p.exists() or not p.is_file():
-            return Response("File not found", status=404)
-
-        suffix = p.suffix.lower()
-        if suffix == ".csv":
-            mimetype = "text/csv; charset=utf-8"
-        elif suffix == ".html":
-            mimetype = "text/html; charset=utf-8"
-        else:
-            mimetype = "text/plain; charset=utf-8"
-
-        return Response(p.read_text(encoding="utf-8", errors="replace"), mimetype=mimetype)
-    except Exception as exc:
-        return Response(f"Failed to read file: {type(exc).__name__}: {exc}", status=500)
 
 
 @app.get("/download_results_zip")

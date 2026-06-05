@@ -300,11 +300,13 @@ def pair_x_group_value(v):
 
 
 def format_x_tick_label(x):
-    if PAIR_X_GROUPS:
-        start = int(x)
-        return f"{start}-{start + X_GROUP_SIZE - 1}"
     f = float(x)
-    return str(int(f)) if abs(f - round(f)) < 1e-9 else f"{f:g}"
+    if abs(f - round(f)) < 1e-9:
+        n = int(round(f))
+        if PAIR_X_GROUPS and n >= X_GROUP_PAIR_START:
+            return f"{n}-{n + X_GROUP_SIZE - 1}"
+        return str(n)
+    return f"{f:g}"
 
 
 def parse_strategy_queries(strategy_value, strategy_name):
@@ -983,6 +985,16 @@ def draw_similarity_line_graph(agg_similarity, model_order, model_colors, x_orde
     ax.set_ylabel(SIMILARITY_Y_LABEL, fontsize=12)
     ax.set_xticks(x)
     ax.set_xticklabels([format_x_tick_label(g) for g in x_order])
+    if len(x_order) == 1:
+        # Keep a single-state similarity graph visually narrow instead of
+        # stretching one point across the whole plotting area.
+        fig.canvas.draw()
+        axis_px = max(float(ax.bbox.width), 1.0)
+        span_for_30px = axis_px / 30.0
+        span = max(span_for_30px, 1.0)
+        ax.set_xlim(-span / 2.0, span / 2.0)
+    elif len(x_order) > 1:
+        ax.set_xlim(-0.5, len(x_order) - 0.5)
     set_percent_axis_ticks(ax, SIMILARITY_Y_MIN, SIMILARITY_Y_MAX)
     ax.grid(True, alpha=0.28)
     ax.set_axisbelow(True)
