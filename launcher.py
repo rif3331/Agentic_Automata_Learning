@@ -1154,6 +1154,8 @@ def _server_cached_html_path(source_path: str, sid: str) -> str:
         return cached
 
     if not src.exists() or not src.is_file():
+        if cached and not Path(cached).exists():
+            state["cached_full_report_path"] = ""
         return ""
 
     try:
@@ -1830,11 +1832,16 @@ function centerIframeContent(frame){
 function centerAllDfaFrames(){
   document.querySelectorAll('iframe.candidate-frame, iframe#target_iframe').forEach(centerIframeContent);
 }
+let latestFullReportUrl = '';
 function updateAnalysisButton(data){
   const btn = document.getElementById('analysis_btn');
   if(!btn) return;
-  const hasReport = !!data.full_report_url;
-  btn.classList.toggle('hidden', !hasReport);
+  if(data && data.full_report_url){
+    latestFullReportUrl = data.full_report_url;
+  }
+  const ended = data && ['won','lost','crashed','stopped'].includes(data.result);
+  const hasReport = !!latestFullReportUrl || !!(data && data.full_report_url);
+  btn.classList.toggle('hidden', !(hasReport || ended));
   btn.textContent = analysisMode ? 'Back to run display' : 'Show full game analysis';
 }
 function showMode(data){
@@ -2128,13 +2135,20 @@ function refreshEvents(){
     }
 
     const full=document.getElementById('full-analysis');
-    if(data.full_report_url && full.dataset.src !== data.full_report_url){ full.src=data.full_report_url; full.dataset.src=data.full_report_url; }
+    if(data.full_report_url){
+      latestFullReportUrl = data.full_report_url;
+      if(full && full.dataset.src !== data.full_report_url){
+        full.src=data.full_report_url;
+        full.dataset.src=data.full_report_url;
+      }
+    }
   });
 }
 function resetToStartScreenKeepKey(){
   // Reset the launcher UI exactly like starting a fresh game, but keep the
   // form values already stored by Flask, including the API key.
   analysisMode=false;
+  latestFullReportUrl='';
   forceForm=true;
   autoScroll=true;
   wasRunning=false;
@@ -2209,6 +2223,7 @@ function stopRun(){
 }
 function newGame(){
   analysisMode=false;
+  latestFullReportUrl='';
   forceForm=true;
   autoScroll=true;
   wasRunning=false;
@@ -2243,6 +2258,10 @@ function showAnalysis(){
   const full = document.getElementById('full-analysis');
 
   if (analysisMode) {
+    if (latestFullReportUrl && full && full.dataset.src !== latestFullReportUrl) {
+      full.src = latestFullReportUrl;
+      full.dataset.src = latestFullReportUrl;
+    }
     if (chat) chat.classList.add('hidden');
     if (full) full.classList.remove('hidden');
     if (btn) btn.textContent = 'Back to run display';

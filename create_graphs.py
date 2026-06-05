@@ -1667,10 +1667,10 @@ def draw_task_outcomes_stacked_bar(df_models):
     # Keep the same model order used elsewhere in the PDF.
     models = order_task_outcome_models_by_success(tmp)
 
-    # Keep horizontal outcome bars visually bounded when there are only a few
-    # models, so a single run/model does not create a bar spanning the whole page.
-    outcome_width = min(12, max(7, 1.25 * max(len(models), 1) + 5.5))
-    fig, ax = plt.subplots(figsize=(outcome_width, max(5, len(models) * 0.6)))
+    # Keep the original graph width. Limit only the visual thickness of each
+    # horizontal bar so a single model/run does not create an oversized bar.
+    fig, ax = plt.subplots(figsize=(FIG_WIDTH, max(5, len(models) * 0.6)))
+    outcome_bar_height = 0.45
 
     left = np.zeros(len(models))
 
@@ -1691,6 +1691,7 @@ def draw_task_outcomes_stacked_bar(df_models):
             models,
             vals,
             left=left,
+            height=outcome_bar_height,
             color=CATEGORY_COLORS[category],
             edgecolor="white",
             label=category,
