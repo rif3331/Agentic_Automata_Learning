@@ -488,7 +488,18 @@ def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Pa
         writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({k: _localize_path_for_results_zip(str(row.get(k, "")), sid, out_dir) for k in fieldnames})
+            localized_row = {}
+            for k in fieldnames:
+                localized_value = _localize_path_for_results_zip(str(row.get(k, "")), sid, out_dir)
+                if k == "conversation_link" and localized_value and not localized_value.startswith("="):
+                    # CSV files cannot know the absolute folder chosen by the user
+                    # after extraction, so use a relative spreadsheet hyperlink.
+                    # When the CSV is opened from the extracted ZIP root, this
+                    # points to html/session_....html regardless of the folder name.
+                    safe_value = localized_value.replace('"', '""')
+                    localized_value = f'=HYPERLINK("{safe_value}","{safe_value}")'
+                localized_row[k] = localized_value
+            writer.writerow(localized_row)
         return buf.getvalue()
     except Exception:
         return _localize_path_for_results_zip(raw, sid, out_dir)
@@ -496,7 +507,27 @@ def _localized_results_csv_text_for_zip(session_csv: Path, sid: str, out_dir: Pa
 
 def _localized_html_content_for_zip(path: Path, sid: str, out_dir: Path) -> str:
     content = path.read_text(encoding="utf-8", errors="replace")
-    return _localize_path_for_results_zip(content, sid, out_dir)
+    content = _localize_path_for_results_zip(content, sid, out_dir)
+
+    # Files such as html/session_....html live one directory below the ZIP root.
+    # Links from them to ZIP-root folders must therefore go up one level.
+    try:
+        rel = path.resolve().relative_to(out_dir).as_posix()
+    except Exception:
+        rel = path.name
+    if rel.startswith("html/"):
+        root_dirs = "DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons"
+        content = re.sub(
+            rf"(?P<prefix>href=[\"']|src=[\"']|url\(|[\"'=:\s(])(?P<dir>{root_dirs})/",
+            lambda m: f"{m.group('prefix')}../{m.group('dir')}/",
+            content,
+        )
+        content = re.sub(
+            rf"(?P<prefix>href=[\"']|src=[\"']|url\(|[\"'=:\s(])html/(?P<dir>{root_dirs})/",
+            lambda m: f"{m.group('prefix')}../{m.group('dir')}/",
+            content,
+        )
+    return content
 
 
 def _run_graph_generation_for_zip(session_csv: Path, sid: str, out_dir: Path) -> tuple[Path | None, str]:
@@ -1286,6 +1317,11 @@ def _hypothesis_paths_by_call_from_logs(text: str) -> dict[str, str]:
     return out
 
 
+def _has_started_agent_tool_call(text: str) -> bool:
+    """True as soon as the model has emitted a tool action, even before the oracle response is printed."""
+    return bool(re.search(r"^🤖\s*Agent tool call #\d+", text, flags=re.MULTILINE)) or "<TOOL_ACTION>" in text
+
+
 def _events_from_logs() -> list[dict[str, str]]:
     text = "\n".join(logs)
     events: list[dict[str, str]] = []
@@ -1909,7 +1945,7 @@ function renderSingleEvent(ev){
       </div>`;
 
 }
-function renderEvents(events, isRunning, result, budgetExhausted){
+function renderEvents(events, isRunning, result, budgetExhausted, toolRequestStarted){
   const host=document.getElementById('chat');
   const full=document.getElementById('full-analysis');
   const shouldStick = autoScroll && nearBottom(host);
@@ -1933,7 +1969,8 @@ function renderEvents(events, isRunning, result, budgetExhausted){
   let parts = events.map(ev => renderSingleEvent(ev));
 
   const hasToolEvents = events.some(ev => ev.type === 'mq' || ev.type === 'eq');
-  if(isRunning && hasInitialPrompt && !hasToolEvents && !budgetExhausted && !isTerminal){
+  const shouldShowLiveThinking = isRunning && hasInitialPrompt && !hasToolEvents && !toolRequestStarted && !budgetExhausted && !isTerminal;
+  if(shouldShowLiveThinking){
     parts.push(`<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
   }
 
@@ -1954,7 +1991,7 @@ function renderEvents(events, isRunning, result, budgetExhausted){
       host.insertAdjacentHTML('beforeend', parts[i] || '');
     }
 
-    if(isRunning && hasInitialPrompt && !hasToolEvents && !budgetExhausted && !isTerminal){
+    if(shouldShowLiveThinking){
       host.insertAdjacentHTML('beforeend', `<div class="turn" data-live-typing="1"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
     }
 
@@ -2038,7 +2075,7 @@ function refreshEvents(){
     else if(data.running){ status.textContent='Running'; if(!wasRunning){ autoScroll=true; renderLocked=false; } forceForm=false; analysisMode=false; }
     else status.textContent='Not in game';
     wasRunning = data.running;
-    renderEvents(data.events, data.running, data.result, data.budget_exhausted);
+    renderEvents(data.events, data.running, data.result, data.budget_exhausted, data.tool_request_started);
 
     const target=document.getElementById('target_iframe');
     if(data.target_url && !target.dataset.src){
@@ -2386,6 +2423,7 @@ def get_events():
         "events": events,
         "target_url": target_url,
         "budget_exhausted": budget_exhausted,
+        "tool_request_started": _has_started_agent_tool_call(text),
         "full_report_url": _path_to_url(game_path, "full") if game_path else "",
         "save_note": _result_save_note_from_logs(text),
         "token_metrics": _latest_token_metrics_from_logs(text),
