@@ -1656,7 +1656,15 @@ def _latest_game_display_path() -> str:
         if html_dir.exists():
             candidates.extend(html_dir.glob("session_*.html"))
         candidates.extend(out_dir.rglob("session_*.html"))
-        candidates = sorted({p.resolve() for p in candidates if p.exists() and p.is_file()}, key=lambda x: x.stat().st_mtime)
+        run_started_at = float(_state(sid).get("run_started_at") or 0.0)
+        filtered = []
+        for p in {p.resolve() for p in candidates if p.exists() and p.is_file()}:
+            try:
+                if not run_started_at or p.stat().st_mtime >= run_started_at - 2.0:
+                    filtered.append(p)
+            except Exception:
+                continue
+        candidates = sorted(filtered, key=lambda x: x.stat().st_mtime)
         if candidates:
             return str(candidates[-1])
     except Exception:
@@ -2420,6 +2428,14 @@ def run():
 
     state["current_full_report_path"] = ""
     state["current_target_path"] = ""
+    state["cached_full_report_path"] = ""
+    state["run_started_at"] = time.time()
+    try:
+        cache_dir = ROOT / "runs" / "server_html_cache" / sid
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+    except Exception:
+        pass
     state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
 
@@ -2590,7 +2606,7 @@ window.addEventListener('load', () => {{
 </html>"""
 
 
-def _zoomed_full_report_document(content: str, scale: float = 0.72) -> str:
+def _zoomed_full_report_document(content: str, scale: float = 0.55) -> str:
     """Serve the full analysis HTML in a wide virtual page and scale it down."""
     escaped = html_lib.escape(content, quote=True)
     virtual_w = 1600
@@ -2748,7 +2764,7 @@ def _html_artifact_response_for_path(path: str, view: str) -> Response:
                 content = re.sub(r"(<head[^>]*>)", r"" + base_tag, content, count=1, flags=re.IGNORECASE)
             else:
                 content = base_tag + content
-        content = _zoomed_full_report_document(content, scale=0.72)
+        content = _zoomed_full_report_document(content, scale=0.55)
 
     return Response(content, mimetype="text/html; charset=utf-8")
 
@@ -2758,7 +2774,9 @@ def analysis_artifact_route():
     sid = _get_sid()
     state = _state(sid)
     game_path = _latest_game_display_path()
-    cached_game_path = _server_cached_html_path(game_path, sid) if game_path else str(state.get("cached_full_report_path") or "")
+    cached_game_path = _server_cached_html_path(game_path, sid) if game_path else ""
+    if not cached_game_path:
+        cached_game_path = str(state.get("cached_full_report_path") or "")
     if not cached_game_path:
         return Response(_analysis_waiting_document(), mimetype="text/html; charset=utf-8")
     return _html_artifact_response_for_path(cached_game_path, "full")
