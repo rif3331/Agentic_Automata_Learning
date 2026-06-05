@@ -78,6 +78,7 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "current_target_path": "",
         "current_full_report_path": "",
         "cached_full_report_path": "",
+        "cached_full_report_source_path": "",
         "last_form": form,
         "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
@@ -833,6 +834,7 @@ def _run_command(cmd: list[str], sid: str) -> None:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
     state["current_full_report_path"] = ""
     state["cached_full_report_path"] = ""
+    state["cached_full_report_source_path"] = ""
     _append_log("Launcher started.")
 
     safe_cmd = []
@@ -1146,12 +1148,15 @@ def _server_cached_html_path(source_path: str, sid: str) -> str:
 
     state = _state(sid)
     cached = str(state.get("cached_full_report_path") or "").strip()
-    if cached and Path(cached).exists():
+    cached_source = str(state.get("cached_full_report_source_path") or "").strip()
+    src_key = str(src)
+    if cached and cached_source == src_key and Path(cached).exists():
         return cached
 
     if not src.exists() or not src.is_file():
         if cached and not Path(cached).exists():
             state["cached_full_report_path"] = ""
+            state["cached_full_report_source_path"] = ""
         return ""
 
     try:
@@ -1160,6 +1165,7 @@ def _server_cached_html_path(source_path: str, sid: str) -> str:
         dst = cache_dir / src.name
         shutil.copy2(src, dst)
         state["cached_full_report_path"] = str(dst)
+        state["cached_full_report_source_path"] = src_key
         return str(dst)
     except Exception as exc:
         _append_log(f"Launcher HTML cache error: {type(exc).__name__}: {exc}")
@@ -2419,6 +2425,8 @@ def run():
         return "API key is required for this model. The server GOOGLE_API_KEY is used only for gemini-3.1-flash-lite-preview.", 400
 
     state["current_full_report_path"] = ""
+    state["cached_full_report_path"] = ""
+    state["cached_full_report_source_path"] = ""
     state["current_target_path"] = ""
     state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
@@ -2481,6 +2489,8 @@ def stop():
     state["running"] = False
     state["process"] = None
     state["current_full_report_path"] = ""
+    state["cached_full_report_path"] = ""
+    state["cached_full_report_source_path"] = ""
     state["current_target_path"] = ""
     return "ok"
 
@@ -2488,7 +2498,7 @@ def stop():
 def get_events():
     state = _state()
     game_path = _latest_game_display_path()
-    cached_game_path = _server_cached_html_path(game_path, _get_sid()) if game_path else str(state.get("cached_full_report_path") or "")
+    cached_game_path = _server_cached_html_path(game_path, _get_sid()) if game_path else ""
 
     target_path = _target_dfa_path()
     target_url = _path_to_url(target_path, "raw") if target_path else ""
@@ -2590,7 +2600,7 @@ window.addEventListener('load', () => {{
 </html>"""
 
 
-def _zoomed_full_report_document(content: str, scale: float = 0.72) -> str:
+def _zoomed_full_report_document(content: str, scale: float = 0.58) -> str:
     """Serve the full analysis HTML in a wide virtual page and scale it down."""
     escaped = html_lib.escape(content, quote=True)
     virtual_w = 1600
@@ -2748,7 +2758,7 @@ def _html_artifact_response_for_path(path: str, view: str) -> Response:
                 content = re.sub(r"(<head[^>]*>)", r"" + base_tag, content, count=1, flags=re.IGNORECASE)
             else:
                 content = base_tag + content
-        content = _zoomed_full_report_document(content, scale=0.72)
+        content = _zoomed_full_report_document(content, scale=0.58)
 
     return Response(content, mimetype="text/html; charset=utf-8")
 
@@ -2758,7 +2768,7 @@ def analysis_artifact_route():
     sid = _get_sid()
     state = _state(sid)
     game_path = _latest_game_display_path()
-    cached_game_path = _server_cached_html_path(game_path, sid) if game_path else str(state.get("cached_full_report_path") or "")
+    cached_game_path = _server_cached_html_path(game_path, sid) if game_path else ""
     if not cached_game_path:
         return Response(_analysis_waiting_document(), mimetype="text/html; charset=utf-8")
     return _html_artifact_response_for_path(cached_game_path, "full")

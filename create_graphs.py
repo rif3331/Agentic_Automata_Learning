@@ -865,6 +865,17 @@ def draw_tool_calls_graph(agg_tool, model_order, model_colors, x_order, agg_lsta
     ax.set_ylabel(TOOL_Y_LABEL, fontsize=12)
     ax.set_xticks(x)
     ax.set_xticklabels([format_x_tick_label(g) for g in x_order])
+    if len(x_order) == 1:
+        # Cap a single vertical bar in the Average tool calls graph to about 30 px.
+        fig.canvas.draw()
+        axis_px = max(float(ax.bbox.width), 1.0)
+        drawn_bar_data_width = max(float(bar_width * 0.92), 1e-6)
+        full_group_data_width = max(float(bar_width * (n_models - 1) + drawn_bar_data_width), drawn_bar_data_width)
+        span_for_30px = drawn_bar_data_width * axis_px / 30.0
+        span = max(span_for_30px, full_group_data_width * 1.35, 1.0)
+        ax.set_xlim(-span / 2.0, span / 2.0)
+    elif len(x_order) > 1:
+        ax.set_xlim(-0.5, len(x_order) - 0.5)
     ax.set_ylim(0, y_max)
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
@@ -1786,15 +1797,11 @@ def main(csv_path, output_pdf_path=PDF_OUTPUT_PATH):
         agg_ttt,
     )
 
-    fig_similarity, _ = draw_grouped_bar_graph(
+    fig_similarity, _ = draw_similarity_line_graph(
         agg_similarity,
         model_order,
         model_colors,
         x_order,
-        SIMILARITY_GRAPH_TITLE,
-        SIMILARITY_Y_LABEL,
-        SIMILARITY_Y_MAX,
-        value_multiplier=100.0,
     )
 
     extra_figures = []
