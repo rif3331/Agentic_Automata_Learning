@@ -462,7 +462,15 @@ def _localize_path_for_results_zip(value: str, sid: str, out_dir: Path) -> str:
     text = re.sub(rf'/[^\s,;"\'<>]*?{re.escape(session_fragment)}', '', text)
     text = re.sub(rf'/[^\s,;"\'<>]*?{generic_session_fragment}', '', text)
 
-    text = re.sub(r"file:/*(?=(html|DFA|L_star_comparisons|session_|graphs\.pdf))", "", text)
+    artifact_dirs = "html|DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons|graphs\.pdf|launcher_logs\.txt|graph_generation_log\.txt|results\.csv"
+    text = re.sub(rf"file:/*(?=({artifact_dirs}))", "", text)
+    text = re.sub(r"(?P<prefix>['\"=(:\s])html/(?P<dir>DFA|evaluations|language_similarity_details|L_star_comparisons|TTT_comparisons)/", r"\g<prefix>\g<dir>/", text)
+    if text.startswith("html/DFA/"):
+        text = text[len("html/"):]
+    if text.startswith("html/evaluations/"):
+        text = text[len("html/"):]
+    if text.startswith("html/language_similarity_details/"):
+        text = text[len("html/"):]
     return text.replace("\\", "/")
 
 
@@ -1763,7 +1771,13 @@ function showMode(data){
   }
   document.getElementById('new_game_btn').classList.toggle('hidden', !ended);
   const dlBtn = document.getElementById('download_results_btn');
-  if(dlBtn){ dlBtn.classList.toggle('hidden', !ended); }
+  if(dlBtn){
+    dlBtn.classList.toggle('hidden', !ended);
+    if(!dlBtn.dataset.downloading){
+      dlBtn.textContent = 'Download ZIP of all runs so far';
+      dlBtn.title = 'Downloads all games that ran so far in this browser session, not necessarily only the latest game.';
+    }
+  }
   const stopBtn = document.getElementById('stop_btn');
   if(stopBtn){ stopBtn.classList.toggle('hidden', !data.running); }
   updateAnalysisButton(data);
@@ -1918,7 +1932,8 @@ function renderEvents(events, isRunning, result, budgetExhausted){
   const hasInitialPrompt = !!(events && events.some(ev => ev.type === 'init_prompt'));
   let parts = events.map(ev => renderSingleEvent(ev));
 
-  if(isRunning && hasInitialPrompt && !budgetExhausted && !isTerminal){
+  const hasToolEvents = events.some(ev => ev.type === 'mq' || ev.type === 'eq');
+  if(isRunning && hasInitialPrompt && !hasToolEvents && !budgetExhausted && !isTerminal){
     parts.push(`<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
   }
 
@@ -1939,7 +1954,7 @@ function renderEvents(events, isRunning, result, budgetExhausted){
       host.insertAdjacentHTML('beforeend', parts[i] || '');
     }
 
-    if(isRunning && hasInitialPrompt && !budgetExhausted && !isTerminal){
+    if(isRunning && hasInitialPrompt && !hasToolEvents && !budgetExhausted && !isTerminal){
       host.insertAdjacentHTML('beforeend', `<div class="turn" data-live-typing="1"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
     }
 
@@ -2069,8 +2084,39 @@ function resetToStartScreenKeepKey(){
   if(dlBtn){ dlBtn.classList.add('hidden'); }
 }
 
-function downloadResultsZip(){
-  window.location.href = '/download_results_zip';
+async function downloadResultsZip(){
+  const btn = document.getElementById('download_results_btn');
+  const original = btn ? (btn.textContent || 'Download ZIP of all runs so far') : '';
+  if(btn){
+    btn.dataset.downloading = '1';
+    btn.disabled = true;
+    btn.innerHTML = 'Preparing ZIP of all runs so far <span class="dots"><span>.</span><span>.</span><span>.</span></span>';
+  }
+  try{
+    const response = await fetch('/download_results_zip');
+    if(!response.ok){
+      const msg = await response.text();
+      throw new Error(msg || `Download failed with status ${response.status}`);
+    }
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'automata_run_results.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  }catch(e){
+    alert(e && e.message ? e.message : 'Failed to download results ZIP');
+  }finally{
+    if(btn){
+      btn.disabled = false;
+      delete btn.dataset.downloading;
+      btn.textContent = original || 'Download ZIP of all runs so far';
+      btn.title = 'Downloads all games that ran so far in this browser session, not necessarily only the latest game.';
+    }
+  }
 }
 function stopRun(){
   fetch('/stop',{method:'POST'}).then(() => {
@@ -2175,13 +2221,6 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
             <label>Algorithm Approximation Ratio</label><select name="algorithm_approximation_ratio">{% for r in ratios %}<option value="{{r}}" {% if form.algorithm_approximation_ratio==r %}selected{% endif %}>{{r}}</option>{% endfor %}</select>
           </div>
         </details>
-        <details>
-          <summary>Output options</summary>
-          <div class="details-body">
-            <label>Output Dir</label><input name="output_dir" value="{{form.output_dir}}">
-            <label>Experiment CSV</label><input name="experiment_csv" value="{{form.experiment_csv}}">
-          </div>
-        </details>
         <button type="submit">Run</button>
       </form>
     </div>
@@ -2199,7 +2238,7 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
       <button id="stop_btn" type="button" class="secondary hidden" onclick="stopRun()">Stop current run</button>
       <button id="analysis_btn" type="button" class="analysis-btn hidden" onclick="showAnalysis()">Show full game analysis</button>
       <div class="end-actions">
-        <button id="download_results_btn" type="button" class="secondary hidden" onclick="downloadResultsZip()">Download results ZIP</button>
+        <button id="download_results_btn" type="button" class="secondary hidden" onclick="downloadResultsZip()" title="Downloads all games that ran so far in this browser session, not necessarily only the latest game.">Download ZIP of all runs so far</button>
         <button id="new_game_btn" type="button" class="new-game hidden" onclick="newGame()">New game</button>
       </div>
     </div>
