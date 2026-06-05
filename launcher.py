@@ -78,10 +78,12 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "current_target_path": "",
         "current_full_report_path": "",
         "cached_full_report_path": "",
+        "cached_full_report_source_path": "",
         "last_form": form,
         "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
         "finalized_once": False,
+        "run_started_at": 0.0,
     }
 
 
@@ -833,6 +835,7 @@ def _run_command(cmd: list[str], sid: str) -> None:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
     state["current_full_report_path"] = ""
     state["cached_full_report_path"] = ""
+    state["cached_full_report_source_path"] = ""
     _append_log("Launcher started.")
 
     safe_cmd = []
@@ -1146,20 +1149,29 @@ def _server_cached_html_path(source_path: str, sid: str) -> str:
 
     state = _state(sid)
     cached = str(state.get("cached_full_report_path") or "").strip()
-    if cached and Path(cached).exists():
+    cached_source = str(state.get("cached_full_report_source_path") or "").strip()
+    src_key = str(src)
+    if cached and cached_source == src_key and Path(cached).exists():
         return cached
 
     if not src.exists() or not src.is_file():
         if cached and not Path(cached).exists():
             state["cached_full_report_path"] = ""
+            state["cached_full_report_source_path"] = ""
         return ""
 
     try:
         cache_dir = ROOT / "runs" / "server_html_cache" / sid
         cache_dir.mkdir(parents=True, exist_ok=True)
         dst = cache_dir / src.name
+        if cached and Path(cached).exists() and Path(cached).resolve() != dst.resolve():
+            try:
+                Path(cached).unlink()
+            except Exception:
+                pass
         shutil.copy2(src, dst)
         state["cached_full_report_path"] = str(dst)
+        state["cached_full_report_source_path"] = src_key
         return str(dst)
     except Exception as exc:
         _append_log(f"Launcher HTML cache error: {type(exc).__name__}: {exc}")
@@ -1656,7 +1668,16 @@ def _latest_game_display_path() -> str:
         if html_dir.exists():
             candidates.extend(html_dir.glob("session_*.html"))
         candidates.extend(out_dir.rglob("session_*.html"))
-        candidates = sorted({p.resolve() for p in candidates if p.exists() and p.is_file()}, key=lambda x: x.stat().st_mtime)
+        started_at = float(_state().get("run_started_at") or 0.0)
+        current_run_candidates = []
+        for candidate in {p.resolve() for p in candidates if p.exists() and p.is_file()}:
+            try:
+                if started_at and candidate.stat().st_mtime < started_at - 2.0:
+                    continue
+                current_run_candidates.append(candidate)
+            except Exception:
+                continue
+        candidates = sorted(current_run_candidates, key=lambda x: x.stat().st_mtime)
         if candidates:
             return str(candidates[-1])
     except Exception:
@@ -2409,6 +2430,7 @@ def run():
 
     state["auto_key_used"] = False
     state["finalized_once"] = False
+    state["run_started_at"] = datetime.now(timezone.utc).timestamp()
     if _is_flash_lite_model(form.get("api_provider", ""), form.get("model_name", "")) and not form.get("api_key", "").strip():
         server_google_key = os.environ.get("GOOGLE_API_KEY", "").strip()
         if server_google_key:
@@ -2419,6 +2441,8 @@ def run():
         return "API key is required for this model. The server GOOGLE_API_KEY is used only for gemini-3.1-flash-lite-preview.", 400
 
     state["current_full_report_path"] = ""
+    state["cached_full_report_path"] = ""
+    state["cached_full_report_source_path"] = ""
     state["current_target_path"] = ""
     state["logs"].clear()
     _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
@@ -2481,6 +2505,8 @@ def stop():
     state["running"] = False
     state["process"] = None
     state["current_full_report_path"] = ""
+    state["cached_full_report_path"] = ""
+    state["cached_full_report_source_path"] = ""
     state["current_target_path"] = ""
     return "ok"
 

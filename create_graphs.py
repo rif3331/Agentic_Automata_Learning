@@ -1786,15 +1786,11 @@ def main(csv_path, output_pdf_path=PDF_OUTPUT_PATH):
         agg_ttt,
     )
 
-    fig_similarity, _ = draw_grouped_bar_graph(
+    fig_similarity, _ = draw_similarity_line_graph(
         agg_similarity,
         model_order,
         model_colors,
         x_order,
-        SIMILARITY_GRAPH_TITLE,
-        SIMILARITY_Y_LABEL,
-        SIMILARITY_Y_MAX,
-        value_multiplier=100.0,
     )
 
     extra_figures = []
