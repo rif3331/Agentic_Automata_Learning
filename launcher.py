@@ -2630,35 +2630,18 @@ def html_artifact_route():
             content = _zoomed_html_document(content, scale=0.30)
 
         elif view == "full":
-            # Render the final game report with a wide virtual viewport.
-            # This avoids the report being squeezed inside the launcher iframe.
-            escaped = html_lib.escape(content, quote=True)
-            content = f'''<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#ffffff; }}
-  #stage {{ width:1440px; transform-origin: top left; }}
-  #inner {{ width:1440px; height:1400px; border:0; display:block; }}
-</style>
-<script>
-function resizeReport() {{
-  const baseWidth = 1440;
-  const scale = Math.min(1, window.innerWidth / baseWidth);
-  const stage = document.getElementById('stage');
-  const inner = document.getElementById('inner');
-  stage.style.transform = 'scale(' + scale + ')';
-  stage.style.height = (inner.offsetHeight * scale) + 'px';
-}}
-window.addEventListener('load', resizeReport);
-window.addEventListener('resize', resizeReport);
-</script>
-</head>
-<body>
-<div id="stage"><iframe id="inner" scrolling="no" srcdoc="{escaped}"></iframe></div>
-</body>
-</html>'''
+            # Serve the saved analysis HTML itself, not a nested srcdoc iframe.
+            # Nesting the full report inside another srcdoc iframe can render as
+            # a blank white page in browsers when the report contains large
+            # embedded srcdoc DFA frames. The outer launcher already displays
+            # this route inside an iframe, so the report should be returned
+            # directly from the temporary server-side copy.
+            base_href = request.url_root.rstrip("/") + "/"
+            base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
+            if re.search(r"<head[^>]*>", content, flags=re.IGNORECASE):
+                content = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, content, count=1, flags=re.IGNORECASE)
+            else:
+                content = base_tag + content
 
         return Response(content, mimetype="text/html; charset=utf-8")
     except Exception as exc:
