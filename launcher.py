@@ -14,6 +14,7 @@ import uuid
 import contextvars
 import zipfile
 import tempfile
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -76,6 +77,7 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "process": None,
         "current_target_path": "",
         "current_full_report_path": "",
+        "cached_full_report_path": "",
         "last_form": form,
         "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
@@ -834,6 +836,7 @@ def _run_command(cmd: list[str], sid: str) -> None:
     if not state["logs"]:
         _append_log("BUDGET_WAIT::Running L* and TTT to compute the query budget for the LLM")
     state["current_full_report_path"] = ""
+    state["cached_full_report_path"] = ""
     _append_log("Launcher started.")
 
     safe_cmd = []
@@ -1123,6 +1126,46 @@ def _latest_token_metrics_from_logs(text: str) -> dict[str, Any]:
         payload["cost_so_far_text"] = _format_money(cost_so_far)
 
     return payload
+
+
+def _server_cached_html_path(source_path: str, sid: str) -> str:
+    """Copy the final report HTML to a temporary server-side cache and return that path.
+
+    This keeps the analysis iframe available even when the original generated
+    artifact path is later moved, localized for ZIP export, or cleaned up.
+    """
+    if not source_path:
+        return ""
+
+    raw = source_path.strip()
+    if raw.startswith("file:///"):
+        raw = raw[8:]
+    elif raw.startswith("file://"):
+        raw = raw[7:]
+
+    try:
+        src = Path(raw).resolve()
+    except Exception:
+        return ""
+
+    state = _state(sid)
+    cached = str(state.get("cached_full_report_path") or "").strip()
+    if cached and Path(cached).exists():
+        return cached
+
+    if not src.exists() or not src.is_file():
+        return ""
+
+    try:
+        cache_dir = ROOT / "runs" / "server_html_cache" / sid
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        dst = cache_dir / src.name
+        shutil.copy2(src, dst)
+        state["cached_full_report_path"] = str(dst)
+        return str(dst)
+    except Exception as exc:
+        _append_log(f"Launcher HTML cache error: {type(exc).__name__}: {exc}")
+        return str(src)
 
 def _path_to_url(path: str | None, view: str = "full") -> str:
     if not path:
@@ -2406,6 +2449,7 @@ def stop():
 def get_events():
     state = _state()
     game_path = _latest_game_display_path()
+    cached_game_path = _server_cached_html_path(game_path, _get_sid()) if game_path else str(state.get("cached_full_report_path") or "")
 
     target_path = _target_dfa_path()
     target_url = _path_to_url(target_path, "raw") if target_path else ""
@@ -2424,7 +2468,7 @@ def get_events():
         "target_url": target_url,
         "budget_exhausted": budget_exhausted,
         "tool_request_started": _has_started_agent_tool_call(text),
-        "full_report_url": _path_to_url(game_path, "full") if game_path else "",
+        "full_report_url": _path_to_url(cached_game_path, "full") if cached_game_path else "",
         "save_note": _result_save_note_from_logs(text),
         "token_metrics": _latest_token_metrics_from_logs(text),
     })
