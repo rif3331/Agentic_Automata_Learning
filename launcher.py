@@ -26,10 +26,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key-for-production")
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_RESULTS_CSV = ROOT / "runs" / "results.csv"
-FALLBACK_RESULTS_CSV = ROOT / "results.csv"
-GLOBAL_RESULTS_CSV = ROOT / "runs" / "all_users_results.csv"
-AUTO_KEY_DAILY_COSTS_CSV = ROOT / "runs" / "auto_key_daily_costs.csv"
+PERSISTENT_ROOT = Path(os.environ.get("PERSISTENT_RESULTS_DIR", os.environ.get("RENDER_DISK_MOUNT_PATH", ROOT / "runs"))).expanduser()
+if not PERSISTENT_ROOT.is_absolute():
+    PERSISTENT_ROOT = ROOT / PERSISTENT_ROOT
+DEFAULT_RESULTS_CSV = PERSISTENT_ROOT / "results.csv"
+FALLBACK_RESULTS_CSV = PERSISTENT_ROOT / "results_fallback.csv"
+GLOBAL_RESULTS_CSV = PERSISTENT_ROOT / "all_users_results.csv"
+AUTO_KEY_DAILY_COSTS_CSV = PERSISTENT_ROOT / "auto_key_daily_costs.csv"
 FLASH_LITE_MODEL = "gemini-3.1-flash-lite-preview"
 
 
@@ -46,6 +49,7 @@ DEFAULT_LAST_FORM: dict[str, str] = {
     "algorithm_approximation_ratio": "2",
     "output_dir": "runs",
     "experiment_csv": "results.csv",
+    "user_description": "",
 }
 
 _current_sid: contextvars.ContextVar[str | None] = contextvars.ContextVar("launcher_current_sid", default=None)
@@ -65,7 +69,7 @@ def _get_sid() -> str:
 
 
 def _session_output_dir(sid: str) -> str:
-    return str(Path("runs") / "sessions" / sid)
+    return str(PERSISTENT_ROOT / "sessions" / sid)
 
 
 def _new_session_state(sid: str) -> dict[str, Any]:
@@ -79,9 +83,12 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "current_full_report_path": "",
         "cached_full_report_path": "",
         "last_form": form,
-        "stop_flag_path": ROOT / "runs" / "sessions" / sid / "STOP_REQUESTED.flag",
+        "stop_flag_path": PERSISTENT_ROOT / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
         "finalized_once": False,
+        "user_ip": "",
+        "user_agent": "",
+        "referer": "",
     }
 
 
@@ -263,7 +270,9 @@ def _is_flash_lite_model(provider: str, model_name: str) -> bool:
 
 def _csv_path_for_session(sid: str) -> Path:
     form = _state(sid)["last_form"]
-    output_dir = ROOT / form.get("output_dir", _session_output_dir(sid))
+    output_dir = Path(form.get("output_dir", _session_output_dir(sid)))
+    if not output_dir.is_absolute():
+        output_dir = ROOT / output_dir
     csv_name = form.get("experiment_csv", "results.csv") or "results.csv"
     return output_dir / csv_name
 
@@ -286,12 +295,35 @@ def _append_rows_to_csv(path: Path, fieldnames: list[str], rows: list[dict[str, 
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists() and path.stat().st_size > 0
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not exists:
+    final_fieldnames = list(fieldnames)
+    old_rows: list[dict[str, str]] = []
+    rewrite = False
+    if exists:
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                old_header = list(reader.fieldnames or [])
+                if old_header:
+                    final_fieldnames = list(old_header)
+                    for name in fieldnames:
+                        if name not in final_fieldnames:
+                            final_fieldnames.append(name)
+                            rewrite = True
+                    if rewrite:
+                        old_rows = list(reader)
+                else:
+                    rewrite = True
+        except Exception:
+            pass
+    mode = "w" if rewrite else "a"
+    with path.open(mode, encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=final_fieldnames, extrasaction="ignore")
+        if not exists or rewrite:
             writer.writeheader()
+            for old_row in old_rows:
+                writer.writerow({k: old_row.get(k, "") for k in final_fieldnames})
         for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
+            writer.writerow({k: row.get(k, "") for k in final_fieldnames})
 
 
 def _append_rows_to_google_sheet(sheet_name: str, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
@@ -351,6 +383,79 @@ def _latest_cost_value_from_logs(text: str) -> float:
         return 0.0
 
 
+
+def _client_ip_from_request() -> str:
+    try:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return request.remote_addr or ""
+    except Exception:
+        return ""
+
+
+def _safe_request_header(name: str) -> str:
+    try:
+        return str(request.headers.get(name, ""))[:500]
+    except Exception:
+        return ""
+
+
+def _launcher_user_metadata(sid: str, form: dict[str, Any], ended_at: str, result: str, cost: float) -> dict[str, Any]:
+    return {
+        "launcher_session_id": sid,
+        "launcher_result": result,
+        "launcher_started_user_description": form.get("user_description", ""),
+        "launcher_user_ip": _state(sid).get("user_ip", ""),
+        "launcher_user_agent": _state(sid).get("user_agent", ""),
+        "launcher_referer": _state(sid).get("referer", ""),
+        "launcher_ended_at_utc": ended_at,
+        "launcher_auto_key_used": "1" if _state(sid).get("auto_key_used") else "0",
+        "launcher_final_cost_usd": f"{cost:.8f}",
+    }
+
+
+def _base_export_header() -> list[str]:
+    return [
+        "run_minute",
+        "llm_model",
+        "game_mode",
+        "max_tool_calls",
+        "llm_total_queries",
+        "alphabet_size",
+        "number_of_states",
+        "seed",
+        "counterexample_mode",
+        "conversation_link",
+        "tools",
+        "hints",
+        "strategies",
+        "total_game_time_s",
+        "game_token_tuple",
+        "step_metrics",
+        "cache_data",
+        "noninformative_queries_info",
+        "target_automaton",
+        "llm_hypothesis_automata",
+        "lstar_hypothesis_automata",
+        "ttt_hypothesis_automata",
+        "full_last_model_context",
+    ]
+
+
+def _append_empty_interrupted_result(sid: str, form: dict[str, Any], ended_at: str, result: str, cost: float) -> None:
+    meta = _launcher_user_metadata(sid, form, ended_at, result, cost)
+    fieldnames = list(meta.keys()) + _base_export_header()
+    row = {col: "None" for col in fieldnames}
+    row.update(meta)
+    row["run_minute"] = datetime.now().strftime("%d/%m/%Y %H:%M")
+    row["llm_model"] = form.get("model_name", "None") or "None"
+    row["alphabet_size"] = "None"
+    row["number_of_states"] = "None"
+    row["seed"] = "None"
+    _append_rows_to_csv(GLOBAL_RESULTS_CSV, fieldnames, [row])
+    _append_rows_to_google_sheet("all_users_results", fieldnames, [row])
+
 def _finalize_run_outputs(sid: str) -> None:
     state = _state(sid)
     if state.get("finalized_once"):
@@ -363,42 +468,46 @@ def _finalize_run_outputs(sid: str) -> None:
     form = dict(state.get("last_form", {}))
     session_csv = _csv_path_for_session(sid)
     fieldnames, rows = _read_csv_rows(session_csv)
+    cost = _latest_cost_value_from_logs(text)
+    meta = _launcher_user_metadata(sid, form, ended_at, result, cost)
 
     enriched_rows: list[dict[str, Any]] = []
     if rows and fieldnames:
-        extra_fields = [
-            "launcher_session_id",
-            "launcher_result",
-            "launcher_ended_at_utc",
-            "launcher_auto_key_used",
-            "launcher_final_cost_usd",
-        ]
+        extra_fields = list(meta.keys())
         merged_fields = list(fieldnames)
         for col in extra_fields:
             if col not in merged_fields:
-                merged_fields.append(col)
-        cost = _latest_cost_value_from_logs(text)
+                merged_fields.insert(0, col)
         for row in rows:
             out = dict(row)
-            out.update({
-                "launcher_session_id": sid,
-                "launcher_result": result,
-                "launcher_ended_at_utc": ended_at,
-                "launcher_auto_key_used": "1" if state.get("auto_key_used") else "0",
-                "launcher_final_cost_usd": f"{cost:.8f}",
-            })
+            out.update(meta)
             enriched_rows.append(out)
         _append_rows_to_csv(GLOBAL_RESULTS_CSV, merged_fields, enriched_rows)
         _append_rows_to_google_sheet("all_users_results", merged_fields, enriched_rows)
+    elif result in {"crashed", "stopped"} or "RUN STOPPED BY USER" in text:
+        _append_empty_interrupted_result(sid, form, ended_at, result, cost)
 
     if state.get("auto_key_used"):
-        cost = _latest_cost_value_from_logs(text)
         day = datetime.now().strftime("%Y-%m-%d")
-        cost_fields = ["date", "session_id", "ended_at_utc", "provider", "model_name", "result", "cost_usd"]
+        cost_fields = [
+            "date",
+            "session_id",
+            "ended_at_utc",
+            "user_description",
+            "user_ip",
+            "user_agent",
+            "provider",
+            "model_name",
+            "result",
+            "cost_usd",
+        ]
         cost_row = {
             "date": day,
             "session_id": sid,
             "ended_at_utc": ended_at,
+            "user_description": form.get("user_description", ""),
+            "user_ip": meta.get("launcher_user_ip", ""),
+            "user_agent": meta.get("launcher_user_agent", ""),
             "provider": form.get("api_provider", ""),
             "model_name": form.get("model_name", ""),
             "result": result,
@@ -406,7 +515,6 @@ def _finalize_run_outputs(sid: str) -> None:
         }
         _append_rows_to_csv(AUTO_KEY_DAILY_COSTS_CSV, cost_fields, [cost_row])
         _append_rows_to_google_sheet("auto_key_daily_costs", cost_fields, [cost_row])
-
 
 def _session_html_files(sid: str) -> list[Path]:
     out_dir = (ROOT / _session_output_dir(sid)).resolve()
@@ -2342,6 +2450,9 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
           <div><label>Model</label><select id="model_name" name="model_name" data-initial="{{form.model_name}}" onchange="updateApiKeyVisibility()"></select></div>
         </div>
         <div id="api_key_box"><label>API Key</label><input id="api_key" type="password" name="api_key" autocomplete="off" value="{{form.api_key}}"></div>
+        <label>User Description</label>
+        <input name="user_description" value="{{form.user_description}}" placeholder="Optional: name / email / group / note for this run">
+        <p class="small">This value is written to the server CSV so you can identify who ran each game.</p>
         <label>Target Automaton Source</label>
         <select id="target_source" name="target_source" onchange="updateTargetSource()">
           <option value="regex" {% if form.target_source=="regex" %}selected{% endif %}>User regular expression → DFA</option>
@@ -2431,6 +2542,9 @@ def run():
     form = state["last_form"]
     for key in list(form.keys()):
         form[key] = request.form.get(key, form[key]).strip()
+    state["user_ip"] = _client_ip_from_request()
+    state["user_agent"] = _safe_request_header("User-Agent")
+    state["referer"] = _safe_request_header("Referer")
 
     form["output_dir"] = _session_output_dir(sid)
     Path(form["output_dir"]).mkdir(parents=True, exist_ok=True)
