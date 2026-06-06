@@ -283,18 +283,29 @@ These reports provide a complete record of the agent's behavior and learning pro
 - `L_star_comparisons/` — comparisons with the L* algorithm.
 - `TTT_comparisons/` — comparisons with the TTT algorithm.
 
-#### Aggregate PDF Report
+### Generating Figures
 
-The generated PDF report summarizes all experiments currently stored in the results table and includes aggregate visualizations similar to those presented in the paper.
+The framework can generate aggregate analyses and visualizations from a previously collected results table.
 
-The report includes:
+Run:
 
-- **Success Rate vs. DFA Size** — shows how performance changes as the number of states increases.
-- **Average Tool Calls vs. DFA Size** — compares query efficiency against L* and TTT.
-- **Best Hypothesis Similarity vs. DFA Size** — measures how close the best hypothesis is to the target DFA.
-- **Average Runtime vs. DFA Size** — reports execution time as task complexity increases.
-- **Token Usage vs. DFA Size** — summarizes token consumption across experiments.
-- **Model Cost vs. DFA Size** — estimates API costs across complexity levels.
-- **Passive Learning Analyses** — evaluates whether the information collected by the model would have been sufficient for classical passive learners to recover the target DFA.
+```bash
+python generate_report.py ^
+  --results-csv runs/results.csv ^
+  --output-dir runs
+```
 
-Together, the CSV table, HTML reports, and PDF visualizations provide a complete record of the experiments and support both detailed run inspection and large-scale performance analysis.
+Replace:
+
+- `runs/results.csv` with the path to the results table you would like to analyze.
+- `runs` with the directory where the generated reports should be saved.
+
+The command generates:
+
+- Aggregate PDF reports.
+- Success-rate visualizations.
+- Query-efficiency comparisons.
+- Similarity analyses.
+- Runtime and token-usage statistics.
+- Cost analyses.
+- Additional figures corresponding to those presented in the paper.
