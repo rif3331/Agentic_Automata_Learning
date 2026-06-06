@@ -1732,7 +1732,7 @@ button.analysis-btn{background:#7c3aed}
 .status-won{background:var(--win)!important;color:#166534!important}
 .status-lost,.status-crashed{background:var(--lose)!important;color:#991b1b!important}
 .mini-frame{width:100%;height:300px;border:1px solid var(--line);border-radius:12px;background:white;display:block;margin:10px auto 0;overflow:hidden}
-.full-frame{width:100%;height:82vh;border:1px solid var(--line);border-radius:16px;background:white}
+.full-frame{width:100%;height:82vh;border:1px solid var(--line);border-radius:16px;background:white;display:block;overflow:hidden}
 .dfa-legend{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0 10px;font-size:12px;color:#344054;text-align:left}
 .legend-item{display:flex;align-items:center;gap:6px;white-space:nowrap}
 .legend-dot{width:12px;height:12px;border-radius:50%;border:1px solid #101828;display:inline-block}
@@ -1859,6 +1859,32 @@ function centerIframeContent(frame){
     frame.dataset.centerHandlerAttached = '1';
   }
 }
+
+function zoomFullAnalysisIframe(frame){
+  if(!frame) return;
+  const applyZoom = () => {
+    try{
+      const doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
+      if(!doc) return;
+      const zoom = '0.72';
+      if(doc.documentElement){
+        doc.documentElement.style.zoom = zoom;
+        doc.documentElement.style.overflow = 'auto';
+      }
+      if(doc.body){
+        doc.body.style.zoom = zoom;
+        doc.body.style.overflow = 'auto';
+        doc.body.style.transformOrigin = '0 0';
+        doc.body.style.margin = doc.body.style.margin || '0';
+      }
+    }catch(e){}
+  };
+  applyZoom();
+  setTimeout(applyZoom, 50);
+  setTimeout(applyZoom, 200);
+  setTimeout(applyZoom, 700);
+}
+
 function centerAllDfaFrames(){
   document.querySelectorAll('iframe.candidate-frame, iframe#target_iframe').forEach(centerIframeContent);
 }
@@ -2375,7 +2401,7 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
   <div id="output-card" class="card output-card hidden">
     <div id="chat" class="chat-wrap"></div>
     <div id="token-usage-footer" class="token-usage-footer hidden"></div>
-    <iframe id="full-analysis" class="full-frame hidden"></iframe>
+    <iframe id="full-analysis" class="full-frame hidden" onload="zoomFullAnalysisIframe(this)"></iframe>
     <div id="save-note" class="save-note hidden"></div>
   </div>
 </div>
