@@ -1866,7 +1866,7 @@ function zoomFullAnalysisIframe(frame){
     try{
       const doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
       if(!doc) return;
-      const zoom = '0.72';
+      const zoom = '0.55';
       if(doc.documentElement){
         doc.documentElement.style.zoom = zoom;
         doc.documentElement.style.overflow = 'auto';
@@ -2319,7 +2319,10 @@ function showAnalysis(){
       full.dataset.src = latestFullReportUrl;
     }
     if (chat) chat.classList.add('hidden');
-    if (full) full.classList.remove('hidden');
+    if (full) {
+      full.classList.remove('hidden');
+      zoomFullAnalysisIframe(full);
+    }
     if (btn) btn.textContent = 'Back to run display';
   } else {
     if (full) full.classList.add('hidden');
