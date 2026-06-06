@@ -306,20 +306,20 @@ After collecting experiment results, aggregate analyses and visualizations can b
 Run:
 
 ```bash
-python create_graphs.py --results-csv runs/results.csv --output-dir runs
+python create_graphs.py runs/results.csv
 ```
 
-Replace:
+Replace `runs/results.csv` with the path to the results table you would like to analyze.
 
-- `runs/results.csv` with the results table you would like to analyze.
-- `runs` with the directory where the generated figures and reports should be saved.
-
-The command generates:
+The script generates:
 
 - PDF reports containing the figures presented in the paper.
 - Success-rate analyses.
 - Query-efficiency comparisons against L* and TTT.
-- Hypothesis similarity analyses.
-- Runtime and token-usage statistics.
+- Hypothesis-similarity analyses.
+- Runtime statistics.
+- Token-usage analyses.
+- Cost analyses.
+- Additional visualizations computed from the collected experiment results.
 - Cost analyses.
 - Additional visualizations computed from the collected experiment results.
