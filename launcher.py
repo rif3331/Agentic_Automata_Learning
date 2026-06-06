@@ -1631,11 +1631,39 @@ def _first_comparison_path() -> str:
     return ""
 
 
+def _latest_session_html_path(sid: str | None = None) -> str:
+    """Return the newest full game-analysis HTML from this browser session.
+
+    The analysis iframe should always show the latest run that actually wrote a
+    session report under runs/sessions/<session_id>/html.  We intentionally use
+    the file modification time here, rather than a cached path or an older log
+    match, because multiple runs can happen inside the same browser session.
+    """
+    try:
+        sid = sid or _get_sid()
+        out_dir = (ROOT / _session_output_dir(sid)).resolve()
+        html_dir = out_dir / "html"
+        candidates = [p for p in html_dir.glob("session_*.html") if p.is_file()]
+        if candidates:
+            candidates.sort(key=lambda p: (p.stat().st_mtime, p.name))
+            return str(candidates[-1])
+    except Exception:
+        pass
+    return ""
+
+
 def _latest_game_display_path() -> str:
+    # Prefer the newest artifact physically written for this browser session.
+    # This fixes the analysis iframe showing the previous run when an older path
+    # still appears in the logs or in server-side state.
+    newest_session_html = _latest_session_html_path()
+    if newest_session_html:
+        return newest_session_html
+
     text = "\n".join(logs)
     patterns = [
-        r'Visual game display:\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+\.html)',
-        r'(?:Game display|Full game analysis|Analysis HTML|HTML report):\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+\.html)',
+        r'Visual game display:\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+?\.html)',
+        r'(?:Game display|Full game analysis|Analysis HTML|HTML report):\s*(?:click here to view it:)?\s*(file:///[^\s"]+?\.html|[A-Za-z]:[^\n]+?\.html|[^\s]+session_[^\s]+?\.html)',
         r'(file:///[^\s"]*?/html/session_[^\s"]+?\.html|[A-Za-z]:[^\n]*?[/\\]html[/\\]session_[^\n]+?\.html|[^\s]+/html/session_[^\s]+?\.html)',
     ]
     for pattern in patterns:
@@ -1643,17 +1671,6 @@ def _latest_game_display_path() -> str:
         if matches:
             return matches[-1].strip()
 
-    # Robust fallback: when the log line is missing or was printed in a slightly
-    # different format, use the newest session HTML generated under this
-    # browser session's output directory.
-    try:
-        sid = _get_sid()
-        out_dir = (ROOT / _session_output_dir(sid)).resolve()
-        candidates = sorted((out_dir / "html").glob("session_*.html"), key=lambda x: x.stat().st_mtime)
-        if candidates:
-            return str(candidates[-1])
-    except Exception:
-        pass
     return ""
 
 
@@ -2481,7 +2498,10 @@ def stop():
 def get_events():
     state = _state()
     game_path = _latest_game_display_path()
-    cached_game_path = _server_cached_html_path(game_path, _get_sid()) if game_path else str(state.get("cached_full_report_path") or "")
+    # Do not resolve the full-analysis iframe through the server HTML cache here:
+    # the user expects the iframe to open the latest session_*.html file from
+    # runs/sessions/<session_id>/html for the most recently completed run.
+    cached_game_path = game_path or str(state.get("cached_full_report_path") or "")
 
     target_path = _target_dfa_path()
     target_url = _path_to_url(target_path, "raw") if target_path else ""
@@ -2689,7 +2709,9 @@ def analysis_artifact_route():
     sid = _get_sid()
     state = _state(sid)
     game_path = _latest_game_display_path()
-    cached_game_path = _server_cached_html_path(game_path, sid) if game_path else str(state.get("cached_full_report_path") or "")
+    # Serve the latest session report directly. This avoids showing a previous
+    # analysis file when cached_full_report_path still points at an older run.
+    cached_game_path = game_path or str(state.get("cached_full_report_path") or "")
     if not cached_game_path:
         return Response("<!doctype html><html><body style='font-family:Arial;padding:24px'>Analysis HTML is not available yet.</body></html>", mimetype="text/html; charset=utf-8")
     return _html_artifact_response_for_path(cached_game_path, "full")
