@@ -574,6 +574,12 @@ def _make_results_zip(sid: str) -> Path:
     graph_pdf, graph_log = _run_graph_generation_for_zip(session_csv, sid, out_dir)
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "MUST_EXTRACT_FOLDER_FOR_LINKS_TO_WORK.txt",
+            "MUST EXTRACT THE FOLDER FOR LINKS TO WORK\n\n"
+            "Please extract the entire ZIP folder before opening results.csv or any HTML files.\n"
+            "The links inside the results table are relative links, so they will work correctly only after the ZIP contents are extracted together into the same folder.\n",
+        )
         if session_csv.exists():
             zf.writestr("results.csv", _localized_results_csv_text_for_zip(session_csv, sid, out_dir))
         for html_path in _session_html_files(sid):
