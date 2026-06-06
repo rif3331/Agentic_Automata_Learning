@@ -2450,9 +2450,6 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
           <div><label>Model</label><select id="model_name" name="model_name" data-initial="{{form.model_name}}" onchange="updateApiKeyVisibility()"></select></div>
         </div>
         <div id="api_key_box"><label>API Key</label><input id="api_key" type="password" name="api_key" autocomplete="off" value="{{form.api_key}}"></div>
-        <label>User Description</label>
-        <input name="user_description" value="{{form.user_description}}" placeholder="Optional: name / email / group / note for this run">
-        <p class="small">This value is written to the server CSV so you can identify who ran each game.</p>
         <label>Target Automaton Source</label>
         <select id="target_source" name="target_source" onchange="updateTargetSource()">
           <option value="regex" {% if form.target_source=="regex" %}selected{% endif %}>User regular expression → DFA</option>
@@ -2878,6 +2875,126 @@ def html_artifact_route():
         return _html_artifact_response_for_path(path, view)
     except Exception as exc:
         return Response(f"Failed to read artifact: {type(exc).__name__}: {exc}", status=500)
+
+
+
+def _admin_results_allowed() -> bool:
+    password = os.environ.get("ADMIN_RESULTS_PASSWORD", "").strip()
+    if not password:
+        return True
+    supplied = request.args.get("key", "") or request.headers.get("X-Admin-Results-Password", "")
+    return supplied == password
+
+
+@app.get("/admin/results.csv")
+def admin_results_csv():
+    if not _admin_results_allowed():
+        return Response("Unauthorized", status=401)
+    if not GLOBAL_RESULTS_CSV.exists():
+        return Response("No results CSV exists yet.", mimetype="text/plain; charset=utf-8")
+    return send_file(GLOBAL_RESULTS_CSV, as_attachment=True, download_name="all_users_results.csv", mimetype="text/csv")
+
+
+@app.get("/admin/results")
+def admin_results():
+    if not _admin_results_allowed():
+        return Response("Unauthorized", status=401)
+
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] = []
+    if GLOBAL_RESULTS_CSV.exists():
+        try:
+            with GLOBAL_RESULTS_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+                reader = csv.DictReader(f)
+                fieldnames = list(reader.fieldnames or [])
+                rows = list(reader)
+        except Exception as exc:
+            return Response(f"Failed to read CSV: {type(exc).__name__}: {exc}", status=500)
+
+    preferred = [
+        "launcher_ended_at_utc",
+        "launcher_result",
+        "launcher_final_cost_usd",
+        "launcher_session_id",
+        "launcher_user_ip",
+        "launcher_user_agent",
+        "llm_model",
+        "number_of_states",
+        "seed",
+        "alphabet_size",
+        "run_minute",
+        "conversation_link",
+    ]
+    columns = [c for c in preferred if c in fieldnames] + [c for c in fieldnames if c not in preferred]
+    rows_for_display = list(reversed(rows))
+
+    def esc(value: Any) -> str:
+        return html_lib.escape(str(value if value is not None else ""), quote=True)
+
+    if not rows_for_display:
+        table_html = "<p class='empty'>No rows were saved yet.</p>"
+    else:
+        head = "".join(f"<th>{esc(c)}</th>" for c in columns)
+        body_parts: list[str] = []
+        for row in rows_for_display:
+            cells = []
+            for col in columns:
+                val = str(row.get(col, ""))
+                shown = val
+                if len(shown) > 280:
+                    shown = shown[:280] + "..."
+                if col == "conversation_link" and (val.startswith("http://") or val.startswith("https://") or val.startswith("/")):
+                    href = esc(val)
+                    cells.append(f"<td><a href='{href}' target='_blank' rel='noopener'>open</a></td>")
+                else:
+                    cells.append(f"<td>{esc(shown)}</td>")
+            body_parts.append("<tr>" + "".join(cells) + "</tr>")
+        table_html = f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_parts)}</tbody></table>"
+
+    updated = ""
+    try:
+        if GLOBAL_RESULTS_CSV.exists():
+            updated = datetime.fromtimestamp(GLOBAL_RESULTS_CSV.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        updated = ""
+
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>All Users Results</title>
+<style>
+body{{font-family:Arial,sans-serif;margin:0;background:#f6f7fb;color:#111827}}
+.wrap{{max-width:96vw;margin:24px auto;padding:0 16px}}
+.card{{background:white;border:1px solid #e5e7eb;border-radius:14px;box-shadow:0 8px 24px rgba(15,23,42,.08);padding:18px}}
+h1{{margin:0 0 8px;font-size:24px}}
+.meta{{color:#667085;font-size:13px;margin-bottom:14px}}
+.actions{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}}
+a.btn{{display:inline-block;text-decoration:none;background:#111827;color:white;border-radius:10px;padding:9px 12px;font-weight:700;font-size:13px}}
+a.btn.secondary{{background:#ffffff;color:#111827;border:1px solid #d0d5dd}}
+.table-wrap{{overflow:auto;max-height:78vh;border:1px solid #e5e7eb;border-radius:12px}}
+table{{border-collapse:separate;border-spacing:0;min-width:1200px;width:100%;font-size:12px}}
+th,td{{border-bottom:1px solid #e5e7eb;border-right:1px solid #eef2f7;padding:8px 10px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:360px}}
+th{{position:sticky;top:0;background:#f9fafb;z-index:2;font-weight:800}}
+tr:hover td{{background:#f9fafb}}
+.empty{{padding:16px;background:#f9fafb;border-radius:10px;color:#667085}}
+</style>
+</head>
+<body>
+<div class="wrap"><div class="card">
+<h1>All Users Results</h1>
+<div class="meta">CSV path: {esc(str(GLOBAL_RESULTS_CSV))} · rows: {len(rows)}{(' · last updated: ' + esc(updated)) if updated else ''}</div>
+<div class="actions">
+<a class="btn" href="/admin/results.csv">Download CSV</a>
+<a class="btn secondary" href="/admin/results">Refresh</a>
+<a class="btn secondary" href="/">Back to runner</a>
+</div>
+<div class="table-wrap">{table_html}</div>
+</div></div>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html; charset=utf-8")
 
 
 @app.get("/download_results_zip")
