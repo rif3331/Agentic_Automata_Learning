@@ -470,14 +470,19 @@ def _finalize_run_outputs(sid: str) -> None:
     cost = _latest_cost_value_from_logs(text)
     meta = _launcher_user_metadata(sid, form, ended_at, result, cost)
 
+    rows_before_run = int(state.get("session_csv_rows_before_run") or 0)
+    new_rows = rows[rows_before_run:] if rows_before_run < len(rows) else []
+    if not new_rows and rows and not (result in {"crashed", "stopped"} or "RUN STOPPED BY USER" in text):
+        new_rows = rows[-1:]
+
     enriched_rows: list[dict[str, Any]] = []
-    if rows and fieldnames:
+    if new_rows and fieldnames:
         extra_fields = list(meta.keys())
         merged_fields = list(fieldnames)
         for col in extra_fields:
             if col not in merged_fields:
                 merged_fields.insert(0, col)
-        for row in rows:
+        for row in new_rows:
             out = dict(row)
             out.update(meta)
             enriched_rows.append(out)
@@ -2545,6 +2550,9 @@ def run():
 
     state["auto_key_used"] = False
     state["finalized_once"] = False
+    session_csv_before = _csv_path_for_session(sid)
+    _, existing_session_rows = _read_csv_rows(session_csv_before)
+    state["session_csv_rows_before_run"] = len(existing_session_rows)
     if _is_flash_lite_model(form.get("api_provider", ""), form.get("model_name", "")) and not form.get("api_key", "").strip():
         server_google_key = os.environ.get("GOOGLE_API_KEY", "").strip()
         if server_google_key:
