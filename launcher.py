@@ -1163,6 +1163,35 @@ def _analysis_from_payload(payload: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def _noninformative_analysis_by_call_from_logs(text: str) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    pattern = re.compile(
+        r"NONINFORMATIVE_ANALYSIS::CALL=([^:\n\r]+)::STATUS=([^:\n\r]*?)::TYPE=([^:\n\r]*?)::DETAILS=(.*?)(?=\n|\r|$)"
+    )
+    for m in pattern.finditer(text):
+        call = str(m.group(1)).strip()
+        status = str(m.group(2)).strip().upper()
+        kind = str(m.group(3) or "").strip()
+        details = str(m.group(4) or "").strip()
+
+        if kind == "-":
+            kind = ""
+        if details == "-":
+            details = ""
+
+        if status != "YES":
+            out[call] = {}
+            continue
+
+        out[call] = {
+            "is_noninformative": "1",
+            "text": "Non-informative",
+            "kind": kind,
+            "details": details,
+        }
+    return out
+
+
 def _passive_learning_by_call_from_logs(text: str) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for m in re.finditer(
@@ -1618,6 +1647,7 @@ def _events_from_logs() -> list[dict[str, str]]:
     passive_learning_by_call = _passive_learning_by_call_from_logs(text)
     language_similarity_by_call = _language_similarity_by_call_from_logs(text)
     token_metrics_by_step = _token_metrics_by_step_from_logs(text)
+    noninformative_by_call = _noninformative_analysis_by_call_from_logs(text)
 
     for obj in _extract_tool_json_blocks(text):
         tool_outputs = obj.get("tool_outputs")
@@ -1657,7 +1687,7 @@ def _events_from_logs() -> list[dict[str, str]]:
                 "oracle_class": "oracle-normal",
                 "iframe": "",
                 "automaton_text": "",
-                "analysis": _analysis_from_payload(payload),
+                "analysis": noninformative_by_call.get(str(call), {}) or _analysis_from_payload(payload),
                 "passive": passive_learning_by_call.get(str(call), {}),
                 "similarity": {},
                 "token_metrics": token_metrics_by_step.get(str(call), {}),
@@ -1694,7 +1724,7 @@ def _events_from_logs() -> list[dict[str, str]]:
                 "oracle": oracle,
                 "oracle_class": oracle_class,
                 "iframe": _path_to_url(report_path, "candidate"),
-                "analysis": _analysis_from_payload(payload),
+                "analysis": noninformative_by_call.get(str(call), {}) or _analysis_from_payload(payload),
                 "passive": passive_learning_by_call.get(str(call), {}),
                 "similarity": language_similarity_by_call.get(str(call), {}),
                 "token_metrics": token_metrics_by_step.get(str(call), {}),

@@ -80,24 +80,14 @@ def extract_tool_calls(model_output: JsonDict) -> List[Tuple[str, Dict[str, Any]
 
 
 def _set_noninformative_analysis(out: ToolOutput, *, is_noninformative: bool, kind: str = "", details: str = "") -> None:
-    """Attach a compact per-tool-call diagnostic used by the launcher UI.
+    """Kept for compatibility with older call sites.
 
-    The user-facing definitions here are intentionally narrow:
-      1. repeated query: duplicate MQ word or duplicate EQ hypothesis
-      2. contradiction of previous information: EQ hypothesis contradicts a previous MQ
+    Non-informative-query diagnostics are intentionally not attached to the
+    oracle TOOL_RESULT, because TOOL_RESULT is sent back to the model. The
+    launcher reads these diagnostics from the separate NONINFORMATIVE_ANALYSIS
+    log line printed by _print_noninformative_analysis.
     """
-    if not isinstance(out, dict):
-        return
-    payload = out.get("output")
-    if not isinstance(payload, dict):
-        payload = {}
-        out["output"] = payload
-    payload["noninformative_analysis"] = {
-        "is_noninformative": bool(is_noninformative),
-        "kind": str(kind or ""),
-        "details": str(details or ""),
-    }
-
+    return
 
 def _print_noninformative_analysis(call_count: int, *, is_noninformative: bool, kind: str = "", details: str = "") -> None:
     status = "YES" if is_noninformative else "NO"
