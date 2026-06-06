@@ -5,5 +5,5 @@ Agentic Automata Learning is an evaluation framework for studying and benchmarki
 ## Components
 
 - 📄 **Research Paper** — Introduces the Agentic Automata Learning framework and presents experimental results on modern LLM agents.
-- 🌐 **Web Interface** — Agentic Automata Learning Runner, an interactive interface for launching experiments, monitoring agent interactions, and visualizing learning trajectories. Available at: https://agentic-automata-learning.onrender.com/
+- 🌐 **Web Interface** — Agentic Automata Learning Runner, an interactive interface for launching experiments, monitoring agent interactions, and visualizing learning trajectories. Available at: https://agentic-automata-learning.onrender.com
 - 💻 Source Code — Complete implementation of the evaluation framework, experiment runner, task generation tools, and analysis utilities.
