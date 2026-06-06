@@ -35,6 +35,8 @@ FALLBACK_RESULTS_CSV = ROOT / "results.csv"
 GLOBAL_RESULTS_CSV = PERSISTENT_CSV_ROOT / "all_users_results.csv"
 AUTO_KEY_DAILY_COSTS_CSV = RUNS_ROOT / "auto_key_daily_costs.csv"
 FLASH_LITE_MODEL = "gemini-3.1-flash-lite-preview"
+FLASH_LITE_DAILY_DOLLAR_BUDGET = float(os.environ.get("FLASH_LITE_DAILY_DOLLAR_BUDGET", os.environ.get("DAILY_FLASH_LITE_DOLLAR_BUDGET", "0") or "0"))
+FLASH_LITE_BUDGET_MESSAGE = "The daily API key budget is finished. Please come back tomorrow, or choose another model and use a matching API key."
 
 
 DEFAULT_LAST_FORM: dict[str, str] = {
@@ -89,6 +91,7 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "user_ip": "",
         "user_agent": "",
         "referer": "",
+        "budget_stop_triggered": False,
     }
 
 
@@ -267,6 +270,95 @@ def _normalize_model_name(model_name: str) -> str:
 def _is_flash_lite_model(provider: str, model_name: str) -> bool:
     return (provider or "").strip().lower() == "google" and _normalize_model_name(model_name) == FLASH_LITE_MODEL
 
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        raw = str(value or "").replace("$", "").replace(",", "").strip()
+        if raw.lower() in {"", "none", "nan"}:
+            return default
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _row_date_is_today(row: dict[str, str]) -> bool:
+    today = datetime.now().date()
+    for col in ("launcher_ended_at_utc", "ended_at_utc"):
+        raw = str(row.get(col, "") or "").strip()
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date() == today
+        except Exception:
+            pass
+    raw = str(row.get("run_minute", "") or "").strip()
+    for fmt in ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).date() == today
+        except Exception:
+            pass
+    return False
+
+
+def _row_is_flash_lite(row: dict[str, str]) -> bool:
+    model = row.get("llm_model") or row.get("model_name") or ""
+    provider = row.get("api_provider") or row.get("provider") or "google"
+    return _is_flash_lite_model(provider, model)
+
+
+def _row_cost_usd(row: dict[str, str]) -> float:
+    for col in ("launcher_final_cost_usd", "final_cost_usd", "total_cost_usd", "cost_usd", "usd", "dollars"):
+        if col in row and str(row.get(col, "")).strip():
+            return _to_float(row.get(col), 0.0)
+    return 0.0
+
+
+def _flash_lite_spent_today() -> float:
+    if FLASH_LITE_DAILY_DOLLAR_BUDGET <= 0:
+        return 0.0
+    _, rows = _read_csv_rows(GLOBAL_RESULTS_CSV)
+    total = 0.0
+    for row in rows:
+        if _row_date_is_today(row) and _row_is_flash_lite(row):
+            total += _row_cost_usd(row)
+    return total
+
+
+def _flash_lite_remaining_today(extra_cost: float = 0.0) -> float:
+    if FLASH_LITE_DAILY_DOLLAR_BUDGET <= 0:
+        return 0.0
+    return max(FLASH_LITE_DAILY_DOLLAR_BUDGET - _flash_lite_spent_today() - max(float(extra_cost or 0.0), 0.0), 0.0)
+
+
+def _flash_lite_budget_enabled_for_form(form: dict[str, Any]) -> bool:
+    return FLASH_LITE_DAILY_DOLLAR_BUDGET > 0 and _is_flash_lite_model(form.get("api_provider", ""), form.get("model_name", ""))
+
+
+def _append_budget_exceeded_message() -> None:
+    _append_log("GAME CRASHED – PARTIAL RESULT SAVED")
+    _append_log("Crash: daily API key budget exceeded.")
+    _append_log("DAILY_BUDGET_EXCEEDED::" + FLASH_LITE_BUDGET_MESSAGE)
+
+
+def _enforce_flash_lite_budget_during_run(sid: str) -> None:
+    state = _state(sid)
+    form = dict(state.get("last_form", {}))
+    if not state.get("running") or state.get("budget_stop_triggered") or not _flash_lite_budget_enabled_for_form(form):
+        return
+    text = "\n".join(state.get("logs", []))
+    current_cost = _latest_cost_value_from_logs(text)
+    if _flash_lite_spent_today() + current_cost <= FLASH_LITE_DAILY_DOLLAR_BUDGET:
+        return
+    state["budget_stop_triggered"] = True
+    _append_budget_exceeded_message()
+    proc = state.get("process")
+    if proc and proc.poll() is None:
+        _request_process_stop(proc)
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            _kill_process_tree(proc)
 
 def _csv_path_for_session(sid: str) -> Path:
     form = _state(sid)["last_form"]
@@ -706,9 +798,11 @@ def _make_results_zip(sid: str) -> Path:
 
 
 def _reader_thread(pipe) -> None:
+    sid = _current_sid.get() or _get_sid()
     try:
         for line in iter(pipe.readline, ""):
             _append_log(line.rstrip("\n"))
+            _enforce_flash_lite_budget_during_run(sid)
     finally:
         try:
             pipe.close()
@@ -1236,6 +1330,11 @@ def _latest_token_metrics_from_logs(text: str) -> dict[str, Any]:
     if cost_so_far is not None:
         payload["cost_so_far_usd"] = cost_so_far
         payload["cost_so_far_text"] = _format_money(cost_so_far)
+        form = dict(_state().get("last_form", {}))
+        if _flash_lite_budget_enabled_for_form(form):
+            payload["daily_budget_remaining_usd"] = _flash_lite_remaining_today(cost_so_far)
+            payload["daily_budget_remaining_text"] = _format_money(payload["daily_budget_remaining_usd"])
+            payload["daily_budget_limit_usd"] = FLASH_LITE_DAILY_DOLLAR_BUDGET
 
     return payload
 
@@ -1861,7 +1960,7 @@ button.analysis-btn{background:#7c3aed}
 .save-note a{color:#475467;text-decoration:underline}
 .token-usage-footer{font-size:12px;line-height:1.35;color:#475467;background:#f9fafb;border:1px solid #e5e7eb;border-radius:12px;margin:8px 2px 0;padding:8px 10px;font-weight:800;text-align:left}
 .token-usage-footer.hidden{display:none!important}
-.token-usage-title{font-weight:900;color:#344054}.token-cost-line{margin-top:4px;color:#475467}
+.token-usage-title{font-weight:900;color:#344054}.token-cost-line{margin-top:4px;color:#475467}.budget-remaining{font-size:11px;font-weight:700;color:#667085}
 .hidden{display:none!important}
 .output-card.hidden{display:none!important}
 .chat-wrap{height:78vh;overflow:auto;background:linear-gradient(180deg,#f8fbff,#f4f7fb);border:1px solid var(--line);border-radius:16px;padding:18px;scroll-behavior:auto}
@@ -2254,8 +2353,11 @@ function updateTokenUsage(data){
   const cachedTokens = fmtNum(m.cache_history_tokens || 0);
   const outputSoFar = fmtNum(m.output_tokens_so_far);
 
+  const remainingText = m.daily_budget_remaining_text
+    ? ` <span class="budget-remaining">(${escapeHtml(m.daily_budget_remaining_text)} left today)</span>`
+    : '';
   const costLine = m.cost_so_far_text
-    ? `<div class="token-cost-line">Cost So Far: ${escapeHtml(m.cost_so_far_text)}</div>`
+    ? `<div class="token-cost-line">Cost So Far: ${escapeHtml(m.cost_so_far_text)}${remainingText}</div>`
     : '';
 
   box.innerHTML = `<div><span class="token-usage-title">Token Usage So Far</span> Input: ${inputTokens} (${cachedTokens} cached) Output: ${outputSoFar}</div>${costLine}`;
@@ -2550,6 +2652,7 @@ def run():
 
     state["auto_key_used"] = False
     state["finalized_once"] = False
+    state["budget_stop_triggered"] = False
     session_csv_before = _csv_path_for_session(sid)
     _, existing_session_rows = _read_csv_rows(session_csv_before)
     state["session_csv_rows_before_run"] = len(existing_session_rows)
@@ -2561,6 +2664,12 @@ def run():
     elif not form.get("api_key", "").strip():
         state["running"] = False
         return "API key is required for this model. The server GOOGLE_API_KEY is used only for gemini-3.1-flash-lite-preview.", 400
+
+    if _flash_lite_budget_enabled_for_form(form):
+        spent_today = _flash_lite_spent_today()
+        if spent_today >= FLASH_LITE_DAILY_DOLLAR_BUDGET:
+            state["running"] = False
+            return FLASH_LITE_BUDGET_MESSAGE, 429
 
     state["current_full_report_path"] = ""
     state["current_target_path"] = ""
@@ -2733,6 +2842,7 @@ window.addEventListener('load', () => {{
 </head>
 <body>
 <div id=\"viewport\"><div id=\"stage\"><iframe id=\"inner\" scrolling=\"no\" srcdoc=\"{escaped}\"></iframe></div></div>
+
 </body>
 </html>"""
 
@@ -2932,6 +3042,70 @@ def admin_results_delete():
     return redirect(url_for("admin_results"))
 
 
+
+
+@app.post("/admin/results/update-dollar")
+def admin_results_update_dollar():
+    if not _admin_results_allowed():
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    if not GLOBAL_RESULTS_CSV.exists():
+        return jsonify({"ok": False, "error": "No results CSV exists yet."}), 404
+
+    data = request.get_json(silent=True) or {}
+    try:
+        row_index = int(data.get("row_index"))
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid row index."}), 400
+
+    column = str(data.get("column") or "launcher_final_cost_usd")
+    value = str(data.get("value") or "").strip()
+
+    allowed_columns = {
+        "launcher_final_cost_usd",
+        "final_cost_usd",
+        "cost_usd",
+        "usd",
+        "dollars",
+        "total_cost_usd",
+    }
+    if column not in allowed_columns:
+        return jsonify({"ok": False, "error": f"Column {column!r} is not editable here."}), 400
+
+    if value:
+        normalized = value.replace("$", "").replace(",", "").strip()
+        if not re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)", normalized):
+            return jsonify({"ok": False, "error": "Dollar value must be a regular number, for example 0.1234."}), 400
+        value = normalized
+
+    try:
+        with GLOBAL_RESULTS_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if row_index < 0 or row_index >= len(rows):
+            return jsonify({"ok": False, "error": "Row index is out of range."}), 400
+
+        if column not in fieldnames:
+            fieldnames.append(column)
+            for row in rows:
+                row.setdefault(column, "")
+
+        rows[row_index][column] = value
+
+        tmp_path = GLOBAL_RESULTS_CSV.with_suffix(GLOBAL_RESULTS_CSV.suffix + ".tmp")
+        GLOBAL_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+        with tmp_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp_path.replace(GLOBAL_RESULTS_CSV)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Failed to update CSV: {type(exc).__name__}: {exc}"}), 500
+
+    return jsonify({"ok": True, "value": value})
+
+
 @app.get("/admin/results")
 def admin_results():
     if not _admin_results_allowed():
@@ -2980,9 +3154,16 @@ def admin_results():
                 shown = val
                 if len(shown) > 280:
                     shown = shown[:280] + "..."
+                editable_dollar_columns = {"launcher_final_cost_usd", "final_cost_usd", "cost_usd", "usd", "dollars", "total_cost_usd"}
                 if col == "conversation_link" and (val.startswith("http://") or val.startswith("https://") or val.startswith("/")):
                     href = esc(val)
                     cells.append(f"<td><a href='{href}' target='_blank' rel='noopener'>open</a></td>")
+                elif col in editable_dollar_columns:
+                    cells.append(
+                        f"<td class='editable-dollar' contenteditable='true' spellcheck='false' "
+                        f"data-row-index='{original_index}' data-column='{esc(col)}' data-original='{esc(val)}' "
+                        f"title='Click to edit, then press Enter or leave the cell'>{esc(shown)}</td>"
+                    )
                 else:
                     cells.append(f"<td>{esc(shown)}</td>")
             body_parts.append("<tr>" + "".join(cells) + "</tr>")
@@ -3020,6 +3201,12 @@ table{{border-collapse:separate;border-spacing:0;min-width:1200px;width:100%;fon
 th,td{{border-bottom:1px solid #e5e7eb;border-right:1px solid #eef2f7;padding:8px 10px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:360px}}
 th{{position:sticky;top:0;background:#f9fafb;z-index:2;font-weight:800}}
 tr:hover td{{background:#f9fafb}}
+.editable-dollar{{background:#fffdf3;cursor:text;outline:0;font-weight:700}}
+.editable-dollar:focus{{box-shadow:inset 0 0 0 2px #f59e0b;background:#fff7d6}}
+.editable-dollar.saving{{opacity:.65}}
+.editable-dollar.saved{{background:#ecfdf3}}
+.editable-dollar.error{{background:#fef3f2;color:#b42318}}
+.edit-hint{{font-size:12px;color:#667085;margin:-4px 0 10px}}
 .empty{{padding:16px;background:#f9fafb;border-radius:10px;color:#667085}}
 </style>
 </head>
@@ -3028,12 +3215,63 @@ tr:hover td{{background:#f9fafb}}
 <h1>All Users Results</h1>
 <div class="meta">CSV path: {esc(str(GLOBAL_RESULTS_CSV))} · rows: {len(rows)}{(' · last updated: ' + esc(updated)) if updated else ''}</div>
 <div class="actions">
-<a class="btn" href="/admin/results.csv">Download CSV</a>
-<a class="btn secondary" href="/admin/results">Refresh</a>
+<a class="btn" href="/admin/results.csv{('?key=' + esc(request.args.get('key', ''))) if request.args.get('key', '') else ''}">Download CSV</a>
+<a class="btn secondary" href="/admin/results{('?key=' + esc(request.args.get('key', ''))) if request.args.get('key', '') else ''}">Refresh</a>
 <a class="btn secondary" href="/">Back to runner</a>
 </div>
+<div class="edit-hint">Tip: click a dollar/cost cell, edit the value, then press Enter or click outside the cell. The CSV on disk is updated immediately.</div>
 <div class="table-wrap">{table_html}</div>
 </div></div>
+
+<script>
+const adminKey = new URLSearchParams(window.location.search).get('key') || '';
+async function saveDollarCell(cell) {{
+  const newValue = cell.innerText.trim();
+  const original = cell.dataset.original || '';
+  if (newValue === original) return;
+  cell.classList.remove('saved', 'error');
+  cell.classList.add('saving');
+  try {{
+    const url = '/admin/results/update-dollar' + (adminKey ? ('?key=' + encodeURIComponent(adminKey)) : '');
+    const res = await fetch(url, {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        row_index: cell.dataset.rowIndex,
+        column: cell.dataset.column,
+        value: newValue
+      }})
+    }});
+    const data = await res.json().catch(() => ({{}}));
+    if (!res.ok || !data.ok) throw new Error(data.error || 'Update failed');
+    cell.innerText = data.value || '';
+    cell.dataset.original = data.value || '';
+    cell.classList.add('saved');
+    setTimeout(() => cell.classList.remove('saved'), 900);
+  }} catch (err) {{
+    cell.classList.add('error');
+    alert(err.message || String(err));
+    cell.innerText = original;
+  }} finally {{
+    cell.classList.remove('saving');
+  }}
+}}
+document.querySelectorAll('.editable-dollar').forEach(cell => {{
+  cell.addEventListener('keydown', event => {{
+    if (event.key === 'Enter') {{
+      event.preventDefault();
+      cell.blur();
+    }}
+    if (event.key === 'Escape') {{
+      event.preventDefault();
+      cell.innerText = cell.dataset.original || '';
+      cell.blur();
+    }}
+  }});
+  cell.addEventListener('blur', () => saveDollarCell(cell));
+}});
+</script>
+
 </body>
 </html>"""
     return Response(html, mimetype="text/html; charset=utf-8")
