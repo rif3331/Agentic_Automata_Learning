@@ -225,6 +225,22 @@ claude-sonnet-4-6
 meta-llama/Llama-3.3-70B-Instruct-Turbo
 ```
 
+### Model Configuration
+
+Some models support additional provider-specific configuration parameters beyond the model name itself. These parameters can be specified inside parentheses following the model name.
+
+For example:
+
+```text
+deepseek-v4-pro(extra_body.thinking.type=enabled, reasoning_effort=high)
+
+gemini-3-flash-preview(thinking_level=high)
+```
+
+The framework interprets the text before the parentheses as the model name and the contents of the parentheses as additional configuration parameters.
+
+Any configuration parameter specified inside the parentheses is forwarded directly to the provider's API request. This allows users to take advantage of any advanced options supported by the provider, such as reasoning budgets, thinking modes, or other model-specific capabilities, without modifying the framework's source code.
+
 ### Output
 
 All experiment artifacts are saved inside the selected output directory. By default:
