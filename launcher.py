@@ -1860,6 +1860,11 @@ function centerIframeContent(frame){
   }
 }
 
+function zoomAnalysisIframe(frame){
+  // Full-analysis sizing is handled by the /html_artifact?view=full wrapper.
+  // Do not inject CSS/zoom into the loaded report, because that distorts
+  // the report layout inside the iframe.
+}
 function centerAllDfaFrames(){
   document.querySelectorAll('iframe.candidate-frame, iframe#target_iframe').forEach(centerIframeContent);
 }
@@ -2171,6 +2176,9 @@ function refreshEvents(){
       if(full && full.dataset.src !== data.full_report_url){
         full.src=data.full_report_url;
         full.dataset.src=data.full_report_url;
+        zoomAnalysisIframe(full);
+      } else {
+        zoomAnalysisIframe(full);
       }
     }
   });
@@ -2292,6 +2300,9 @@ function showAnalysis(){
     if (latestFullReportUrl && full && full.dataset.src !== latestFullReportUrl) {
       full.src = latestFullReportUrl;
       full.dataset.src = latestFullReportUrl;
+      zoomAnalysisIframe(full);
+    } else if (full) {
+      zoomAnalysisIframe(full);
     }
     if (chat) chat.classList.add('hidden');
     if (full) full.classList.remove('hidden');
@@ -2376,7 +2387,7 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
   <div id="output-card" class="card output-card hidden">
     <div id="chat" class="chat-wrap"></div>
     <div id="token-usage-footer" class="token-usage-footer hidden"></div>
-    <iframe id="full-analysis" class="full-frame hidden"></iframe>
+    <iframe id="full-analysis" class="full-frame hidden" onload="zoomAnalysisIframe(this)"></iframe>
     <div id="save-note" class="save-note hidden"></div>
   </div>
 </div>
@@ -2691,16 +2702,37 @@ def _html_artifact_response_for_path(path: str, view: str) -> Response:
         content = _zoomed_html_document(content, scale=0.30)
 
     elif view == "full":
-        # Keep the report itself as the iframe document. Do not wrap it in an
-        # additional iframe/srcdoc. Add a base only for relative non-embedded
-        # links, while the session HTML remains fully visible.
-        base_href = request.url_root.rstrip("/") + "/"
-        base_tag = f'<base href="{html_lib.escape(base_href, quote=True)}">'
-        if "<base " not in content.lower():
-            if re.search(r"<head[^>]*>", content, flags=re.IGNORECASE):
-                content = re.sub(r"(<head[^>]*>)", r"\1" + base_tag, content, count=1, flags=re.IGNORECASE)
-            else:
-                content = base_tag + content
+        # Display the final game report exactly like the older launcher did:
+        # render the report inside a wide virtual viewport and scale that
+        # viewport down to the iframe width. This prevents the analysis HTML
+        # from being squeezed into the iframe's narrow width.
+        escaped = html_lib.escape(content, quote=True)
+        content = f'''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body {{ margin:0; padding:0; width:100%; height:100%; overflow:hidden; background:#ffffff; }}
+  #stage {{ width:1440px; transform-origin: top left; }}
+  #inner {{ width:1440px; height:1400px; border:0; display:block; }}
+</style>
+<script>
+function resizeReport() {{
+  const baseWidth = 1440;
+  const scale = Math.min(1, window.innerWidth / baseWidth);
+  const stage = document.getElementById('stage');
+  const inner = document.getElementById('inner');
+  stage.style.transform = 'scale(' + scale + ')';
+  stage.style.height = (inner.offsetHeight * scale) + 'px';
+}}
+window.addEventListener('load', resizeReport);
+window.addEventListener('resize', resizeReport);
+</script>
+</head>
+<body>
+<div id="stage"><iframe id="inner" scrolling="no" srcdoc="{escaped}"></iframe></div>
+</body>
+</html>'''
 
     return Response(content, mimetype="text/html; charset=utf-8")
 
