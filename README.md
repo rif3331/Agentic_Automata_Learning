@@ -59,9 +59,16 @@ The game ends either when the agent successfully identifies the hidden automaton
 
 #### 1. Clone the Repository
 
+Replace `USER` with the GitHub username that owns the repository. For example, if the repository is hosted under `john`, the URL would be:
+
 ```bash
-git clone https://github.com/USER/Agentic-Automata-Learning.git
-cd Agentic-Automata-Learning
+git clone https://github.com/john/Agentic_Automata_Learning.git
+```
+
+Then enter the project directory:
+
+```bash
+cd Agentic_Automata_Learning
 ```
 
 #### 2. Create a Virtual Environment
