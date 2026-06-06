@@ -299,29 +299,27 @@ These reports provide a complete record of the agent's behavior and learning pro
 - `L_star_comparisons/` — comparisons with the L* algorithm.
 - `TTT_comparisons/` — comparisons with the TTT algorithm.
 
-### Generating Figures
+### Generating the Paper Figures
 
-The framework can generate aggregate analyses and visualizations from a previously collected results table.
+After collecting experiment results, aggregate analyses and visualizations can be generated directly from the results table.
 
 Run:
 
 ```bash
-python generate_report.py ^
-  --results-csv runs/results.csv ^
-  --output-dir runs
+python create_graphs.py --results-csv runs/results.csv --output-dir runs
 ```
 
 Replace:
 
-- `runs/results.csv` with the path to the results table you would like to analyze.
-- `runs` with the directory where the generated reports should be saved.
+- `runs/results.csv` with the results table you would like to analyze.
+- `runs` with the directory where the generated figures and reports should be saved.
 
 The command generates:
 
-- Aggregate PDF reports.
-- Success-rate visualizations.
-- Query-efficiency comparisons.
-- Similarity analyses.
+- PDF reports containing the figures presented in the paper.
+- Success-rate analyses.
+- Query-efficiency comparisons against L* and TTT.
+- Hypothesis similarity analyses.
 - Runtime and token-usage statistics.
 - Cost analyses.
-- Additional figures corresponding to those presented in the paper.
+- Additional visualizations computed from the collected experiment results.
