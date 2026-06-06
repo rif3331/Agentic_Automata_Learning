@@ -1732,7 +1732,7 @@ button.analysis-btn{background:#7c3aed}
 .status-won{background:var(--win)!important;color:#166534!important}
 .status-lost,.status-crashed{background:var(--lose)!important;color:#991b1b!important}
 .mini-frame{width:100%;height:300px;border:1px solid var(--line);border-radius:12px;background:white;display:block;margin:10px auto 0;overflow:hidden}
-.full-frame{width:100%;height:82vh;border:1px solid var(--line);border-radius:16px;background:white;display:block;overflow:hidden}
+.full-frame{width:100%;height:82vh;border:1px solid var(--line);border-radius:16px;background:white}
 .dfa-legend{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin:8px 0 10px;font-size:12px;color:#344054;text-align:left}
 .legend-item{display:flex;align-items:center;gap:6px;white-space:nowrap}
 .legend-dot{width:12px;height:12px;border-radius:50%;border:1px solid #101828;display:inline-block}
@@ -1860,29 +1860,53 @@ function centerIframeContent(frame){
   }
 }
 
-function zoomFullAnalysisIframe(frame){
-  if(!frame) return;
-  const applyZoom = () => {
+function zoomAnalysisIframe(frame){
+  function applyZoom(){
     try{
-      const doc = frame.contentDocument || (frame.contentWindow && frame.contentWindow.document);
-      if(!doc) return;
-      const zoom = '0.55';
-      if(doc.documentElement){
-        doc.documentElement.style.zoom = zoom;
-        doc.documentElement.style.overflow = 'auto';
+      const doc = frame.contentDocument || (frame.contentWindow ? frame.contentWindow.document : null);
+      if(!doc || !doc.documentElement || !doc.body) return;
+      const id = 'launcher-analysis-iframe-zoom-fix';
+      let style = doc.getElementById(id);
+      if(!style){
+        style = doc.createElement('style');
+        style.id = id;
+        doc.head.appendChild(style);
       }
-      if(doc.body){
-        doc.body.style.zoom = zoom;
-        doc.body.style.overflow = 'auto';
-        doc.body.style.transformOrigin = '0 0';
-        doc.body.style.margin = doc.body.style.margin || '0';
-      }
+      style.textContent = `
+        html, body {
+          overflow: auto !important;
+          height: auto !important;
+          min-height: 100% !important;
+        }
+        body {
+          zoom: 0.72 !important;
+        }
+        @supports not (zoom: 1) {
+          body {
+            transform: scale(0.72) !important;
+            transform-origin: 0 0 !important;
+            width: 138.8889% !important;
+            min-height: 138.8889% !important;
+          }
+        }
+      `;
     }catch(e){}
-  };
+  }
+
   applyZoom();
   setTimeout(applyZoom, 50);
   setTimeout(applyZoom, 200);
-  setTimeout(applyZoom, 700);
+  setTimeout(applyZoom, 600);
+
+  if(!frame.dataset.analysisZoomHandlerAttached){
+    frame.addEventListener('load', () => {
+      applyZoom();
+      setTimeout(applyZoom, 50);
+      setTimeout(applyZoom, 200);
+      setTimeout(applyZoom, 600);
+    });
+    frame.dataset.analysisZoomHandlerAttached = '1';
+  }
 }
 
 function centerAllDfaFrames(){
@@ -2196,6 +2220,9 @@ function refreshEvents(){
       if(full && full.dataset.src !== data.full_report_url){
         full.src=data.full_report_url;
         full.dataset.src=data.full_report_url;
+        zoomAnalysisIframe(full);
+      } else {
+        zoomAnalysisIframe(full);
       }
     }
   });
@@ -2317,12 +2344,12 @@ function showAnalysis(){
     if (latestFullReportUrl && full && full.dataset.src !== latestFullReportUrl) {
       full.src = latestFullReportUrl;
       full.dataset.src = latestFullReportUrl;
+      zoomAnalysisIframe(full);
+    } else if (full) {
+      zoomAnalysisIframe(full);
     }
     if (chat) chat.classList.add('hidden');
-    if (full) {
-      full.classList.remove('hidden');
-      zoomFullAnalysisIframe(full);
-    }
+    if (full) full.classList.remove('hidden');
     if (btn) btn.textContent = 'Back to run display';
   } else {
     if (full) full.classList.add('hidden');
@@ -2404,7 +2431,7 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
   <div id="output-card" class="card output-card hidden">
     <div id="chat" class="chat-wrap"></div>
     <div id="token-usage-footer" class="token-usage-footer hidden"></div>
-    <iframe id="full-analysis" class="full-frame hidden" onload="zoomFullAnalysisIframe(this)"></iframe>
+    <iframe id="full-analysis" class="full-frame hidden" onload="zoomAnalysisIframe(this)"></iframe>
     <div id="save-note" class="save-note hidden"></div>
   </div>
 </div>
