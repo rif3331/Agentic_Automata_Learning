@@ -26,13 +26,14 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-this-secret-key-for-production")
 
 ROOT = Path(__file__).resolve().parent
-PERSISTENT_ROOT = Path(os.environ.get("PERSISTENT_RESULTS_DIR", os.environ.get("RENDER_DISK_MOUNT_PATH", ROOT / "runs"))).expanduser()
-if not PERSISTENT_ROOT.is_absolute():
-    PERSISTENT_ROOT = ROOT / PERSISTENT_ROOT
-DEFAULT_RESULTS_CSV = PERSISTENT_ROOT / "results.csv"
-FALLBACK_RESULTS_CSV = PERSISTENT_ROOT / "results_fallback.csv"
-GLOBAL_RESULTS_CSV = PERSISTENT_ROOT / "all_users_results.csv"
-AUTO_KEY_DAILY_COSTS_CSV = PERSISTENT_ROOT / "auto_key_daily_costs.csv"
+RUNS_ROOT = ROOT / "runs"
+PERSISTENT_CSV_ROOT = Path(os.environ.get("PERSISTENT_RESULTS_DIR", os.environ.get("RENDER_DISK_MOUNT_PATH", RUNS_ROOT))).expanduser()
+if not PERSISTENT_CSV_ROOT.is_absolute():
+    PERSISTENT_CSV_ROOT = ROOT / PERSISTENT_CSV_ROOT
+DEFAULT_RESULTS_CSV = RUNS_ROOT / "results.csv"
+FALLBACK_RESULTS_CSV = ROOT / "results.csv"
+GLOBAL_RESULTS_CSV = PERSISTENT_CSV_ROOT / "all_users_results.csv"
+AUTO_KEY_DAILY_COSTS_CSV = RUNS_ROOT / "auto_key_daily_costs.csv"
 FLASH_LITE_MODEL = "gemini-3.1-flash-lite-preview"
 
 
@@ -49,7 +50,6 @@ DEFAULT_LAST_FORM: dict[str, str] = {
     "algorithm_approximation_ratio": "2",
     "output_dir": "runs",
     "experiment_csv": "results.csv",
-    "user_description": "",
 }
 
 _current_sid: contextvars.ContextVar[str | None] = contextvars.ContextVar("launcher_current_sid", default=None)
@@ -69,7 +69,7 @@ def _get_sid() -> str:
 
 
 def _session_output_dir(sid: str) -> str:
-    return str(PERSISTENT_ROOT / "sessions" / sid)
+    return str(Path("runs") / "sessions" / sid)
 
 
 def _new_session_state(sid: str) -> dict[str, Any]:
@@ -83,7 +83,7 @@ def _new_session_state(sid: str) -> dict[str, Any]:
         "current_full_report_path": "",
         "cached_full_report_path": "",
         "last_form": form,
-        "stop_flag_path": PERSISTENT_ROOT / "sessions" / sid / "STOP_REQUESTED.flag",
+        "stop_flag_path": RUNS_ROOT / "sessions" / sid / "STOP_REQUESTED.flag",
         "auto_key_used": False,
         "finalized_once": False,
         "user_ip": "",
@@ -405,7 +405,6 @@ def _launcher_user_metadata(sid: str, form: dict[str, Any], ended_at: str, resul
     return {
         "launcher_session_id": sid,
         "launcher_result": result,
-        "launcher_started_user_description": form.get("user_description", ""),
         "launcher_user_ip": _state(sid).get("user_ip", ""),
         "launcher_user_agent": _state(sid).get("user_agent", ""),
         "launcher_referer": _state(sid).get("referer", ""),
@@ -493,7 +492,6 @@ def _finalize_run_outputs(sid: str) -> None:
             "date",
             "session_id",
             "ended_at_utc",
-            "user_description",
             "user_ip",
             "user_agent",
             "provider",
@@ -505,7 +503,6 @@ def _finalize_run_outputs(sid: str) -> None:
             "date": day,
             "session_id": sid,
             "ended_at_utc": ended_at,
-            "user_description": form.get("user_description", ""),
             "user_ip": meta.get("launcher_user_ip", ""),
             "user_agent": meta.get("launcher_user_agent", ""),
             "provider": form.get("api_provider", ""),
@@ -2895,6 +2892,38 @@ def admin_results_csv():
     return send_file(GLOBAL_RESULTS_CSV, as_attachment=True, download_name="all_users_results.csv", mimetype="text/csv")
 
 
+@app.post("/admin/results/delete")
+def admin_results_delete():
+    if not _admin_results_allowed():
+        return Response("Unauthorized", status=401)
+    if not GLOBAL_RESULTS_CSV.exists():
+        return redirect(url_for("admin_results"))
+    selected = request.form.getlist("row_index")
+    try:
+        indexes = {int(x) for x in selected}
+    except Exception:
+        indexes = set()
+    if not indexes:
+        return redirect(url_for("admin_results", key=request.args.get("key", "")))
+    try:
+        with GLOBAL_RESULTS_CSV.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+        kept = [row for i, row in enumerate(rows) if i not in indexes]
+        GLOBAL_RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+        with GLOBAL_RESULTS_CSV.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(kept)
+    except Exception as exc:
+        return Response(f"Failed to delete rows: {type(exc).__name__}: {exc}", status=500)
+    key = request.args.get("key", "")
+    if key:
+        return redirect(url_for("admin_results", key=key))
+    return redirect(url_for("admin_results"))
+
+
 @app.get("/admin/results")
 def admin_results():
     if not _admin_results_allowed():
@@ -2926,7 +2955,7 @@ def admin_results():
         "conversation_link",
     ]
     columns = [c for c in preferred if c in fieldnames] + [c for c in fieldnames if c not in preferred]
-    rows_for_display = list(reversed(rows))
+    rows_for_display = list(reversed(list(enumerate(rows))))
 
     def esc(value: Any) -> str:
         return html_lib.escape(str(value if value is not None else ""), quote=True)
@@ -2934,10 +2963,10 @@ def admin_results():
     if not rows_for_display:
         table_html = "<p class='empty'>No rows were saved yet.</p>"
     else:
-        head = "".join(f"<th>{esc(c)}</th>" for c in columns)
+        head = "<th>Delete</th>" + "".join(f"<th>{esc(c)}</th>" for c in columns)
         body_parts: list[str] = []
-        for row in rows_for_display:
-            cells = []
+        for original_index, row in rows_for_display:
+            cells = [f"<td><input type='checkbox' name='row_index' value='{original_index}'></td>"]
             for col in columns:
                 val = str(row.get(col, ""))
                 shown = val
@@ -2949,7 +2978,9 @@ def admin_results():
                 else:
                     cells.append(f"<td>{esc(shown)}</td>")
             body_parts.append("<tr>" + "".join(cells) + "</tr>")
-        table_html = f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(body_parts)}</tbody></table>"
+        delete_key = esc(request.args.get("key", ""))
+        delete_action = f"/admin/results/delete?key={delete_key}" if delete_key else "/admin/results/delete"
+        table_html = f'<form method="post" action="{delete_action}" onsubmit="return confirm(\'Delete selected rows from disk?\');"><div class="delete-actions"><button type="submit">Delete selected rows</button></div><table><thead><tr>{head}</tr></thead><tbody>{"".join(body_parts)}</tbody></table></form>'
 
     updated = ""
     try:
@@ -2973,6 +3004,9 @@ h1{{margin:0 0 8px;font-size:24px}}
 .actions{{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}}
 a.btn{{display:inline-block;text-decoration:none;background:#111827;color:white;border-radius:10px;padding:9px 12px;font-weight:700;font-size:13px}}
 a.btn.secondary{{background:#ffffff;color:#111827;border:1px solid #d0d5dd}}
+.delete-actions{{padding:10px;background:#fff;position:sticky;left:0;z-index:3}}
+button{{background:#b42318;color:white;border:0;border-radius:10px;padding:9px 12px;font-weight:800;cursor:pointer}}
+input[type=checkbox]{{transform:scale(1.2)}}
 .table-wrap{{overflow:auto;max-height:78vh;border:1px solid #e5e7eb;border-radius:12px}}
 table{{border-collapse:separate;border-spacing:0;min-width:1200px;width:100%;font-size:12px}}
 th,td{{border-bottom:1px solid #e5e7eb;border-right:1px solid #eef2f7;padding:8px 10px;text-align:left;vertical-align:top;white-space:pre-wrap;max-width:360px}}
