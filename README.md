@@ -164,7 +164,7 @@ Controls how counterexamples are selected when an equivalence query fails.
 
 Available modes:
 
-- `deterministic short counterexample` — selects a short counterexample deterministically from a small candidate set.
+- `deterministic short counterexample (defult)` — selects a short counterexample deterministically from a small candidate set.
 - `minimal counterexample` — always returns the shortest possible counterexample.
 
 #### Algorithm Approximation Ratio
