@@ -1860,55 +1860,6 @@ function centerIframeContent(frame){
   }
 }
 
-function zoomAnalysisIframe(frame){
-  function applyZoom(){
-    try{
-      const doc = frame.contentDocument || (frame.contentWindow ? frame.contentWindow.document : null);
-      if(!doc || !doc.documentElement || !doc.body) return;
-      const id = 'launcher-analysis-iframe-zoom-fix';
-      let style = doc.getElementById(id);
-      if(!style){
-        style = doc.createElement('style');
-        style.id = id;
-        doc.head.appendChild(style);
-      }
-      style.textContent = `
-        html, body {
-          overflow: auto !important;
-          height: auto !important;
-          min-height: 100% !important;
-        }
-        body {
-          zoom: 0.72 !important;
-        }
-        @supports not (zoom: 1) {
-          body {
-            transform: scale(0.72) !important;
-            transform-origin: 0 0 !important;
-            width: 138.8889% !important;
-            min-height: 138.8889% !important;
-          }
-        }
-      `;
-    }catch(e){}
-  }
-
-  applyZoom();
-  setTimeout(applyZoom, 50);
-  setTimeout(applyZoom, 200);
-  setTimeout(applyZoom, 600);
-
-  if(!frame.dataset.analysisZoomHandlerAttached){
-    frame.addEventListener('load', () => {
-      applyZoom();
-      setTimeout(applyZoom, 50);
-      setTimeout(applyZoom, 200);
-      setTimeout(applyZoom, 600);
-    });
-    frame.dataset.analysisZoomHandlerAttached = '1';
-  }
-}
-
 function centerAllDfaFrames(){
   document.querySelectorAll('iframe.candidate-frame, iframe#target_iframe').forEach(centerIframeContent);
 }
@@ -2220,9 +2171,6 @@ function refreshEvents(){
       if(full && full.dataset.src !== data.full_report_url){
         full.src=data.full_report_url;
         full.dataset.src=data.full_report_url;
-        zoomAnalysisIframe(full);
-      } else {
-        zoomAnalysisIframe(full);
       }
     }
   });
@@ -2344,9 +2292,6 @@ function showAnalysis(){
     if (latestFullReportUrl && full && full.dataset.src !== latestFullReportUrl) {
       full.src = latestFullReportUrl;
       full.dataset.src = latestFullReportUrl;
-      zoomAnalysisIframe(full);
-    } else if (full) {
-      zoomAnalysisIframe(full);
     }
     if (chat) chat.classList.add('hidden');
     if (full) full.classList.remove('hidden');
@@ -2431,7 +2376,7 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
   <div id="output-card" class="card output-card hidden">
     <div id="chat" class="chat-wrap"></div>
     <div id="token-usage-footer" class="token-usage-footer hidden"></div>
-    <iframe id="full-analysis" class="full-frame hidden" onload="zoomAnalysisIframe(this)"></iframe>
+    <iframe id="full-analysis" class="full-frame hidden"></iframe>
     <div id="save-note" class="save-note hidden"></div>
   </div>
 </div>
