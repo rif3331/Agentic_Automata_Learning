@@ -2000,12 +2000,12 @@ button.analysis-btn{background:#7c3aed}
 .hidden{display:none!important}
 .output-card.hidden{display:none!important}
 .chat-wrap{height:78vh;overflow:auto;background:linear-gradient(180deg,#f8fbff,#f4f7fb);border:1px solid var(--line);border-radius:16px;padding:18px;scroll-behavior:auto}
-.intro-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dbe3ef;border-radius:16px;padding:14px 18px;box-shadow:0 4px 18px rgba(15,23,42,.05);font-size:12px;line-height:1.28;color:#344054}
-.intro-doc h2{font-size:18px;line-height:1.15;margin:0 0 8px;color:#172033}
-.intro-doc h3{font-size:13px;margin:10px 0 4px;color:#172033}
-.intro-doc p{margin:5px 0}
-.intro-doc ul{margin:4px 0 6px 16px;padding:0}
-.intro-doc li{margin:3px 0}
+.intro-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dbe3ef;border-radius:14px;padding:10px 14px;box-shadow:0 4px 18px rgba(15,23,42,.05);font-size:11px;line-height:1.22;color:#344054}
+.intro-doc h2{font-size:16px;line-height:1.1;margin:0 0 6px;color:#172033}
+.intro-doc h3{font-size:12px;margin:7px 0 3px;color:#172033}
+.intro-doc p{margin:4px 0}
+.intro-doc ul{margin:3px 0 4px 14px;padding:0}
+.intro-doc li{margin:2px 0}
 .intro-doc strong{color:#172033}
 .chat-wrap.intro-mode{overflow:hidden}
 .turn{display:flex;flex-direction:column;gap:10px;margin:14px 0}
@@ -2054,31 +2054,16 @@ let introVisible = true;
 function escapeHtml(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function introHtml(){
   return `<div class="intro-doc">
-    <h2>Operating Instructions</h2>
-    <p>The <strong>Agentic Automata Learning Runner</strong> provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.</p>
-    <p>The interface first allows users to select the API provider and the model used during the experiment. By default, the runner is configured to use <strong>Gemini 3.1 Flash Lite</strong>, which is available free of charge through a shared daily budget of <strong>$40</strong> across all users of the demo. For other models, users are required to provide their own API key.</p>
-    <p>Users can choose between two sources for the hidden DFA:</p>
+    <h2>How to Run the Demo</h2>
+    <p>Choose an API provider, model, and hidden DFA source, then click <strong>Run</strong>.</p>
+    <p><strong>Gemini 3.1 Flash Lite</strong> can be used without an API key through the shared <strong>$40</strong> daily demo budget. Other models require your own API key.</p>
     <ul>
-      <li><strong>User Regular Expression → DFA</strong> – define a custom target automaton by providing a regular expression. The expression is automatically converted into a minimal DFA and used as the hidden target in the experiment.</li>
-      <li><strong>Dataset DFA</strong> – sample a target DFA from the same generated dataset distribution used in our experiments. When this option is selected, users specify:
-        <ul>
-          <li><strong>Number of States</strong> – the number of states in the hidden minimal DFA.</li>
-          <li><strong>Seed</strong> – the random seed used to select or generate the target automaton.</li>
-        </ul>
-      </li>
+      <li><strong>Regular Expression → DFA:</strong> enter a regex; it is converted into a minimal hidden DFA.</li>
+      <li><strong>Dataset DFA:</strong> choose the number of states and seed to sample a DFA from the experiment distribution.</li>
     </ul>
-    <h3>Advanced Experiment Options</h3>
-    <p>Some experiment parameters are hidden under the <em>Experiment Options</em> section because the default values correspond to the configuration used throughout the paper's evaluation.</p>
-    <ul>
-      <li><strong>Alphabet Size</strong> – controls the size of the DFA alphabet used during generation. Larger alphabets generally increase the complexity of the learning task. This parameter is relevant only when using a dataset DFA.</li>
-      <li><strong>Counterexample Mode</strong> – determines how counterexamples are selected when an equivalence query fails. The default setting returns deterministic short counterexamples, matching the protocol used in our experiments.</li>
-      <li><strong>Algorithm Approximation Ratio</strong> – controls the query budget allocated to the agent. The budget is defined relative to the number of queries required by classical active automata learning algorithms, such as L* and TTT. The default value of <strong>2</strong> corresponds to the experimental setup in which agents receive up to twice the query budget required by the stronger classical baseline.</li>
-    </ul>
-    <h3>Running an Experiment</h3>
-    <p>After clicking <strong>Run</strong>, the system first executes the classical active automata learning algorithms <strong>L*</strong> and <strong>TTT</strong> in order to compute the query budget for the selected target automaton. Once the budget has been determined, the interaction between the LLM agent and the oracle begins.</p>
-    <p>During the game, the interface provides real-time analyses, including whether each query is informative or non-informative, whether passive learning algorithms can already infer the target automaton from the accumulated observations, and the similarity between each proposed hypothesis and the hidden target DFA.</p>
-    <p>The game ends either when the agent successfully identifies the hidden automaton or when it exhausts its allocated query budget. At the end of the interaction, the game status is updated accordingly. Users can then view a detailed analysis of the run, start a new game, or download the results of all experiments performed so far.</p>
-    <p>The downloaded package includes a consolidated results table, an HTML report for each game containing the complete interaction history and all associated analyses, and PDF reports containing aggregate graphs and visualizations generated from the collected results, corresponding to the analyses presented in the paper.</p>
+    <p><strong>Experiment Options</strong> keeps paper-default settings such as alphabet size, counterexample mode, and query-budget ratio.</p>
+    <p>After Run, the system computes the L* / TTT budget, then shows the live agent–oracle interaction, query analyses, passive-learning checks, and hypothesis similarity.</p>
+    <p>The game ends on success or when the budget is exhausted. You can then view the full analysis, start a new game, or download the results ZIP.</p>
   </div>`;
 }
 function showIntroInChat(){
@@ -2346,6 +2331,10 @@ function renderEvents(events, isRunning, result, budgetExhausted, toolRequestSta
   }
 
   events = events || [];
+  if(forceForm && !isRunning){
+    showIntroInChat();
+    return;
+  }
   let parts = events.map(ev => renderSingleEvent(ev));
 
   const lastEventForThinking = events && events.length ? events[events.length - 1] : null;
@@ -2686,11 +2675,15 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
   <div id="output-card" class="card output-card">
     <div id="chat" class="chat-wrap intro-mode">
       <div class="intro-doc">
-        <h2>Operating Instructions</h2>
-        <p>The <strong>Agentic Automata Learning Runner</strong> provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.</p>
-        <p>The interface first allows users to select the API provider and the model used during the experiment. By default, the runner is configured to use <strong>Gemini 3.1 Flash Lite</strong>, which is available free of charge through a shared daily budget of <strong>$40</strong> across all users of the demo. For other models, users are required to provide their own API key.</p>
-        <p>Users can choose between a custom regular expression converted to a minimal DFA, or a dataset DFA sampled from the same distribution used in the experiments.</p>
-        <p>After clicking <strong>Run</strong>, the system computes the L* and TTT query budget and then starts the live interaction between the LLM agent and the oracle.</p>
+        <h2>How to Run the Demo</h2>
+        <p>Choose an API provider, model, and hidden DFA source, then click <strong>Run</strong>.</p>
+        <p><strong>Gemini 3.1 Flash Lite</strong> can run without an API key through the shared <strong>$40</strong> daily demo budget. Other models require your own API key.</p>
+        <ul>
+          <li><strong>Regular Expression → DFA:</strong> enter a regex that becomes the hidden minimal DFA.</li>
+          <li><strong>Dataset DFA:</strong> choose states and seed to sample a DFA.</li>
+        </ul>
+        <p>During a run, the page shows the live agent–oracle interaction, analyses, passive-learning checks, and hypothesis similarity.</p>
+        <p>At the end, view the full analysis, start a new game, or download the results ZIP.</p>
       </div>
     </div>
     <div id="token-usage-footer" class="token-usage-footer hidden"></div>
