@@ -13,7 +13,7 @@ Agentic Automata Learning is an evaluation framework for studying Large Language
 
 ## Web Interface
 <p align="center">
-  <img src="images/img1.gif" height="300" alt="Agentic Automata Learning Runner Demo">
+  <img src="app/images/img1.gif" height="300" alt="Agentic Automata Learning Runner Demo">
 </p>
 
 The Agentic Automata Learning Runner provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.
