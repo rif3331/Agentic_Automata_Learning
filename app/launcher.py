@@ -1994,6 +1994,13 @@ button.analysis-btn{background:#7c3aed}
 .hidden{display:none!important}
 .output-card.hidden{display:none!important}
 .chat-wrap{height:78vh;overflow:auto;background:linear-gradient(180deg,#f8fbff,#f4f7fb);border:1px solid var(--line);border-radius:16px;padding:18px;scroll-behavior:auto}
+.intro-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dbe3ef;border-radius:18px;padding:22px 26px;box-shadow:0 4px 18px rgba(15,23,42,.05);font-size:15px;line-height:1.55;color:#344054}
+.intro-doc h2{font-size:24px;line-height:1.2;margin:0 0 14px;color:#172033}
+.intro-doc h3{font-size:17px;margin:22px 0 8px;color:#172033}
+.intro-doc p{margin:10px 0}
+.intro-doc ul{margin:8px 0 12px 22px;padding:0}
+.intro-doc li{margin:7px 0}
+.intro-doc strong{color:#172033}
 .turn{display:flex;flex-direction:column;gap:10px;margin:14px 0}
 .turn-tool{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start;margin:14px 0}
 .right-stack{display:flex;flex-direction:column;gap:10px;align-self:start}
@@ -2037,6 +2044,39 @@ let lockedFrameSrcByCall = {};
 let renderedEventKeys = [];
 
 function escapeHtml(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function introHtml(){
+  return `<div class="intro-doc">
+    <h2>Web Interface</h2>
+    <p>The <strong>Agentic Automata Learning Runner</strong> provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.</p>
+    <p>The interface first allows users to select the API provider and the model used during the experiment. By default, the runner is configured to use <strong>Gemini 3.1 Flash Lite</strong>, which is available free of charge through a shared daily budget of <strong>$40</strong> across all users of the demo. For other models, users are required to provide their own API key.</p>
+    <p>Users can choose between two sources for the hidden DFA:</p>
+    <ul>
+      <li><strong>User Regular Expression → DFA</strong> – define a custom target automaton by providing a regular expression. The expression is automatically converted into a minimal DFA and used as the hidden target in the experiment.</li>
+      <li><strong>Dataset DFA</strong> – sample a target DFA from the same generated dataset distribution used in our experiments. When this option is selected, users specify:
+        <ul>
+          <li><strong>Number of States</strong> – the number of states in the hidden minimal DFA.</li>
+          <li><strong>Seed</strong> – the random seed used to select or generate the target automaton.</li>
+        </ul>
+      </li>
+    </ul>
+    <h3>Advanced Experiment Options</h3>
+    <p>Some experiment parameters are hidden under the <em>Experiment Options</em> section because the default values correspond to the configuration used throughout the paper's evaluation.</p>
+    <ul>
+      <li><strong>Alphabet Size</strong> – controls the size of the DFA alphabet used during generation. Larger alphabets generally increase the complexity of the learning task. This parameter is relevant only when using a dataset DFA.</li>
+      <li><strong>Counterexample Mode</strong> – determines how counterexamples are selected when an equivalence query fails. The default setting returns deterministic short counterexamples, matching the protocol used in our experiments.</li>
+      <li><strong>Algorithm Approximation Ratio</strong> – controls the query budget allocated to the agent. The budget is defined relative to the number of queries required by classical active automata learning algorithms, such as L* and TTT. The default value of <strong>2</strong> corresponds to the experimental setup in which agents receive up to twice the query budget required by the stronger classical baseline.</li>
+    </ul>
+    <h3>Running an Experiment</h3>
+    <p>After clicking <strong>Run</strong>, the system first executes the classical active automata learning algorithms <strong>L*</strong> and <strong>TTT</strong> in order to compute the query budget for the selected target automaton. Once the budget has been determined, the interaction between the LLM agent and the oracle begins.</p>
+    <p>During the game, the interface provides real-time analyses, including whether each query is informative or non-informative, whether passive learning algorithms can already infer the target automaton from the accumulated observations, and the similarity between each proposed hypothesis and the hidden target DFA.</p>
+    <p>The game ends either when the agent successfully identifies the hidden automaton or when it exhausts its allocated query budget. At the end of the interaction, the game status is updated accordingly. Users can then view a detailed analysis of the run, start a new game, or download the results of all experiments performed so far.</p>
+    <p>The downloaded package includes a consolidated results table, an HTML report for each game containing the complete interaction history and all associated analyses, and PDF reports containing aggregate graphs and visualizations generated from the collected results, corresponding to the analyses presented in the paper.</p>
+  </div>`;
+}
+function showIntroInChat(){
+  const chat=document.getElementById('chat');
+  if(chat){ chat.innerHTML=introHtml(); chat.classList.remove('hidden'); }
+}
 function isFlashLiteSelected(){
   const provider=document.getElementById('api_provider') ? document.getElementById('api_provider').value : '';
   const model=document.getElementById('model_name') ? document.getElementById('model_name').value.replace(/\s*\([^)]*\)\s*$/, '') : '';
@@ -2151,8 +2191,10 @@ function showMode(data){
 
   const outputCard = document.getElementById('output-card');
   const hasEvents = data.events && data.events.length > 0;
-  const shouldShowOutput = data.running || ended || hasEvents || analysisMode;
-  if(outputCard){ outputCard.classList.toggle('hidden', !shouldShowOutput || forceForm); }
+  const shouldShowIntro = !data.running && !ended && !hasEvents && !analysisMode;
+  const shouldShowOutput = shouldShowIntro || data.running || ended || hasEvents || analysisMode;
+  if(outputCard){ outputCard.classList.toggle('hidden', !shouldShowOutput); }
+  if(shouldShowIntro){ showIntroInChat(); }
 }
 function eventRenderKey(ev){
   return `${ev.type || ''}:${ev.call || ''}:${ev.iframe || ''}`;
@@ -2299,8 +2341,8 @@ function renderEvents(events, isRunning, result, budgetExhausted, toolRequestSta
   const hasInitialPrompt = !!(events && events.some(ev => ev.type === 'init_prompt'));
   let parts = events.map(ev => renderSingleEvent(ev));
 
-  const hasToolEvents = events.some(ev => ev.type === 'mq' || ev.type === 'eq');
-  const shouldShowLiveThinking = isRunning && hasInitialPrompt && !hasToolEvents && !toolRequestStarted && !budgetExhausted && !isTerminal;
+  const hasVisibleStart = hasInitialPrompt || (events && events.length > 0);
+  const shouldShowLiveThinking = isRunning && hasVisibleStart && !budgetExhausted && !isTerminal;
   if(shouldShowLiveThinking){
     parts.push(`<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
   }
@@ -2455,10 +2497,10 @@ function resetToStartScreenKeepKey(){
   const tokenUsage=document.getElementById('token-usage-footer');
   const dlBtn=document.getElementById('download_results_btn');
 
-  if(chat){ chat.innerHTML=''; chat.classList.remove('hidden'); }
+  if(chat){ showIntroInChat(); }
   if(full){ full.classList.add('hidden'); full.removeAttribute('src'); full.dataset.src=''; }
   if(target){ target.removeAttribute('src'); target.dataset.src=''; }
-  if(outputCard){ outputCard.classList.add('hidden'); }
+  if(outputCard){ outputCard.classList.remove('hidden'); }
   if(status){ status.textContent='Not in game'; status.className=''; }
   if(saveNote){ saveNote.innerHTML=''; saveNote.classList.add('hidden'); }
   if(tokenUsage){ tokenUsage.innerHTML=''; tokenUsage.classList.add('hidden'); }
@@ -2526,11 +2568,11 @@ function newGame(){
   const saveNote=document.getElementById('save-note');
   const tokenUsage=document.getElementById('token-usage-footer');
   const dlBtn=document.getElementById('download_results_btn');
-  if(chat){ chat.innerHTML=''; chat.classList.remove('hidden'); }
+  if(chat){ showIntroInChat(); }
   if(full){ full.classList.add('hidden'); full.removeAttribute('src'); full.dataset.src=''; }
   const target=document.getElementById('target_iframe');
   if(target){ target.removeAttribute('src'); target.dataset.src=''; }
-  if(outputCard){ outputCard.classList.add('hidden'); }
+  if(outputCard){ outputCard.classList.remove('hidden'); }
   if(status){ status.textContent='Not in game'; status.className=''; }
   if(saveNote){ saveNote.innerHTML=''; saveNote.classList.add('hidden'); }
   if(tokenUsage){ tokenUsage.innerHTML=''; tokenUsage.classList.add('hidden'); }
@@ -2568,7 +2610,7 @@ function showAnalysis(){
   refreshEvents();
 }
 setInterval(refreshEvents,800);
-window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();refreshEvents();};
+window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();showIntroInChat();refreshEvents();};
 </script>
 </head>
 <body>
@@ -2632,8 +2674,16 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
       </div>
     </div>
   </div>
-  <div id="output-card" class="card output-card hidden">
-    <div id="chat" class="chat-wrap"></div>
+  <div id="output-card" class="card output-card">
+    <div id="chat" class="chat-wrap">
+      <div class="intro-doc">
+        <h2>Web Interface</h2>
+        <p>The <strong>Agentic Automata Learning Runner</strong> provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.</p>
+        <p>The interface first allows users to select the API provider and the model used during the experiment. By default, the runner is configured to use <strong>Gemini 3.1 Flash Lite</strong>, which is available free of charge through a shared daily budget of <strong>$40</strong> across all users of the demo. For other models, users are required to provide their own API key.</p>
+        <p>Users can choose between a custom regular expression converted to a minimal DFA, or a dataset DFA sampled from the same distribution used in the experiments.</p>
+        <p>After clicking <strong>Run</strong>, the system computes the L* and TTT query budget and then starts the live interaction between the LLM agent and the oracle.</p>
+      </div>
+    </div>
     <div id="token-usage-footer" class="token-usage-footer hidden"></div>
     <iframe id="full-analysis" class="full-frame hidden" onload="zoomAnalysisIframe(this)"></iframe>
     <div id="save-note" class="save-note hidden"></div>
