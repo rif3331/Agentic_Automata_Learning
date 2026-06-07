@@ -8,7 +8,7 @@ Agentic Automata Learning is an evaluation framework for studying Large Language
 ## Components
 
 - 📄 **Research Paper** - Introduces the Agentic Automata Learning framework and presents experimental results on modern LLM agents.
-- 💻 **Source Code** - Complete implementation of the evaluation framework, experiment runner, task generation tools, and analysis utilities.[![Website](https://img.shields.io/badge/website-blue.svg)](https://agentic-automata-learning.onrender.com)
+- 💻 **Source Code** (https://agentic-automata-learning.onrender.com) - Complete implementation of the evaluation framework, experiment runner, task generation tools, and analysis utilities.
 - 🌐 **Web Interface** - Agentic Automata Learning Runner, an interactive interface for launching experiments, monitoring agent interactions, and visualizing learning trajectories. Users can explore and run experiments directly in the browser for free, with no installation or API key required.
 <p align="center">
   <img src="app/images/img1.gif" height="300" alt="Agentic Automata Learning Runner Demo">
