@@ -1607,6 +1607,12 @@ def _has_started_agent_tool_call(text: str) -> bool:
     return bool(re.search(r"^🤖\s*Agent tool call #\d+", text, flags=re.MULTILINE)) or "<TOOL_ACTION>" in text
 
 
+def _has_pending_agent_tool_call(text: str) -> bool:
+    started = {m.group(1) for m in re.finditer(r"^🤖\s*Agent tool call #\s*(\d+)", text, flags=re.MULTILINE)}
+    confirmed = _confirmed_tool_call_numbers_from_logs(text)
+    return bool(started - confirmed)
+
+
 def _events_from_logs() -> list[dict[str, str]]:
     text = "\n".join(logs)
     events: list[dict[str, str]] = []
@@ -1994,13 +2000,14 @@ button.analysis-btn{background:#7c3aed}
 .hidden{display:none!important}
 .output-card.hidden{display:none!important}
 .chat-wrap{height:78vh;overflow:auto;background:linear-gradient(180deg,#f8fbff,#f4f7fb);border:1px solid var(--line);border-radius:16px;padding:18px;scroll-behavior:auto}
-.intro-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dbe3ef;border-radius:18px;padding:22px 26px;box-shadow:0 4px 18px rgba(15,23,42,.05);font-size:15px;line-height:1.55;color:#344054}
-.intro-doc h2{font-size:24px;line-height:1.2;margin:0 0 14px;color:#172033}
-.intro-doc h3{font-size:17px;margin:22px 0 8px;color:#172033}
-.intro-doc p{margin:10px 0}
-.intro-doc ul{margin:8px 0 12px 22px;padding:0}
-.intro-doc li{margin:7px 0}
+.intro-doc{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dbe3ef;border-radius:16px;padding:14px 18px;box-shadow:0 4px 18px rgba(15,23,42,.05);font-size:12px;line-height:1.28;color:#344054}
+.intro-doc h2{font-size:18px;line-height:1.15;margin:0 0 8px;color:#172033}
+.intro-doc h3{font-size:13px;margin:10px 0 4px;color:#172033}
+.intro-doc p{margin:5px 0}
+.intro-doc ul{margin:4px 0 6px 16px;padding:0}
+.intro-doc li{margin:3px 0}
 .intro-doc strong{color:#172033}
+.chat-wrap.intro-mode{overflow:hidden}
 .turn{display:flex;flex-direction:column;gap:10px;margin:14px 0}
 .turn-tool{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start;margin:14px 0}
 .right-stack{display:flex;flex-direction:column;gap:10px;align-self:start}
@@ -2042,11 +2049,12 @@ let lastRenderedEventsKey = "";
 let renderLocked = false;
 let lockedFrameSrcByCall = {};
 let renderedEventKeys = [];
+let introVisible = true;
 
 function escapeHtml(s){return String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 function introHtml(){
   return `<div class="intro-doc">
-    <h2>Web Interface</h2>
+    <h2>Operating Instructions</h2>
     <p>The <strong>Agentic Automata Learning Runner</strong> provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.</p>
     <p>The interface first allows users to select the API provider and the model used during the experiment. By default, the runner is configured to use <strong>Gemini 3.1 Flash Lite</strong>, which is available free of charge through a shared daily budget of <strong>$40</strong> across all users of the demo. For other models, users are required to provide their own API key.</p>
     <p>Users can choose between two sources for the hidden DFA:</p>
@@ -2075,7 +2083,7 @@ function introHtml(){
 }
 function showIntroInChat(){
   const chat=document.getElementById('chat');
-  if(chat){ chat.innerHTML=introHtml(); chat.classList.remove('hidden'); }
+  if(chat){ chat.innerHTML=introHtml(); chat.classList.remove('hidden'); chat.classList.add('intro-mode'); introVisible = true; renderedEventKeys = []; }
 }
 function isFlashLiteSelected(){
   const provider=document.getElementById('api_provider') ? document.getElementById('api_provider').value : '';
@@ -2338,14 +2346,12 @@ function renderEvents(events, isRunning, result, budgetExhausted, toolRequestSta
   }
 
   events = events || [];
-  const hasInitialPrompt = !!(events && events.some(ev => ev.type === 'init_prompt'));
   let parts = events.map(ev => renderSingleEvent(ev));
 
-  const hasVisibleStart = hasInitialPrompt || (events && events.length > 0);
-  const shouldShowLiveThinking = isRunning && hasVisibleStart && !budgetExhausted && !isTerminal;
-  if(shouldShowLiveThinking){
-    parts.push(`<div class="turn"><div class="msg typing"><span class="emoji">🤖</span><span class="dots"><span>.</span><span>.</span><span>.</span></span></div></div>`);
-  }
+  const lastEventForThinking = events && events.length ? events[events.length - 1] : null;
+  const waitingForFirstTool = isRunning && lastEventForThinking && lastEventForThinking.type === 'init_prompt' && !toolRequestStarted;
+  const waitingForNextTool = isRunning && lastEventForThinking && (lastEventForThinking.type === 'mq' || lastEventForThinking.type === 'eq') && !toolRequestStarted;
+  const shouldShowLiveThinking = !budgetExhausted && !isTerminal && (waitingForFirstTool || waitingForNextTool);
 
   const currentKeys = events.map(ev => eventRenderKey(ev));
   let canAppendOnly = renderedEventKeys.length <= currentKeys.length;
@@ -2359,6 +2365,7 @@ function renderEvents(events, isRunning, result, budgetExhausted, toolRequestSta
   if(canAppendOnly){
     const typing = host.querySelector('[data-live-typing="1"]');
     if(typing) typing.remove();
+    if(introVisible && currentKeys.length > 0){ host.innerHTML=''; host.classList.remove('intro-mode'); introVisible=false; renderedEventKeys=[]; }
 
     for(let i=renderedEventKeys.length; i<currentKeys.length; i++){
       host.insertAdjacentHTML('beforeend', parts[i] || '');
@@ -2372,6 +2379,8 @@ function renderEvents(events, isRunning, result, budgetExhausted, toolRequestSta
     centerAllDfaFrames();
   } else {
     host.innerHTML = parts.join('');
+    host.classList.remove('intro-mode');
+    introVisible = false;
     renderedEventKeys = currentKeys.slice();
     centerAllDfaFrames();
   }
@@ -2675,9 +2684,9 @@ window.onload=()=>{updateModels();updateApiKeyVisibility();updateTargetSource();
     </div>
   </div>
   <div id="output-card" class="card output-card">
-    <div id="chat" class="chat-wrap">
+    <div id="chat" class="chat-wrap intro-mode">
       <div class="intro-doc">
-        <h2>Web Interface</h2>
+        <h2>Operating Instructions</h2>
         <p>The <strong>Agentic Automata Learning Runner</strong> provides an interactive web interface for configuring, running, and analyzing Agentic Automata Learning experiments directly from the browser.</p>
         <p>The interface first allows users to select the API provider and the model used during the experiment. By default, the runner is configured to use <strong>Gemini 3.1 Flash Lite</strong>, which is available free of charge through a shared daily budget of <strong>$40</strong> across all users of the demo. For other models, users are required to provide their own API key.</p>
         <p>Users can choose between a custom regular expression converted to a minimal DFA, or a dataset DFA sampled from the same distribution used in the experiments.</p>
@@ -2844,7 +2853,7 @@ def get_events():
         "events": events,
         "target_url": target_url,
         "budget_exhausted": budget_exhausted,
-        "tool_request_started": _has_started_agent_tool_call(text),
+        "tool_request_started": _has_pending_agent_tool_call(text),
         "full_report_url": report_url,
         "save_note": _result_save_note_from_logs(text),
         "token_metrics": _latest_token_metrics_from_logs(text),
