@@ -306,7 +306,7 @@ After collecting experiment results, aggregate analyses and visualizations can b
 Run:
 
 ```bash
-python create_graphs.py runs/results.csv
+python app/create_graphs.py runs/results.csv
 ```
 
 Replace `runs/results.csv` with the path to the results table you would like to analyze.
