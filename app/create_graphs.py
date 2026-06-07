@@ -14,6 +14,8 @@ from matplotlib.colors import to_rgb
 from matplotlib.lines import Line2D
 from scipy.ndimage import gaussian_filter1d
 
+GRAPH_SCRIPT_VERSION = "centered_success_bars_delta_title_classical_center_legend_v5"
+
 
 # =========================
 # USER CONFIGURATION
@@ -115,9 +117,35 @@ SUCCESS_GRAPH_TITLE = "Model performance as the number of states in the minimal 
 SUCCESS_Y_LABEL = "Success rate (%) →"
 SIMILARITY_GRAPH_TITLE = "Best hypothesis similarity as the number of states in the minimal DFA increases"
 SIMILARITY_Y_LABEL = "Best hypothesis similarity (%) →"
-TOOL_GRAPH_TITLE = "Average tool calls as the number of states in the minimal DFA increases"
-TOOL_Y_LABEL = "Avg Tool calls (← lower is better)"
+TOOL_GRAPH_TITLE = "Δ Tool Calls from TTT as the number of states in the minimal DFA increases"
+TOOL_Y_LABEL = "Δ Tool Calls from TTT"
 X_AXIS_LABEL = "Number of States in the Minimal DFA"
+
+# Tool-call delta graph:
+#   0 = show all models in the Δ Tool Calls from TTT graph.
+#   1 = show only Gemini Pro and Deepseek Pro in the Δ Tool Calls from TTT graph.
+#
+# IMPORTANT:
+#   This variable affects ONLY the Δ Tool Calls from TTT graph.
+#   The success/similarity/failure graphs still use all models.
+#
+# The Δ graph uses:
+#   model line value = llm_total_queries - TTTStrategy
+#   only successful model rows, meaning llm_total_queries must be numeric and not X.
+#   L* reference value = LStarStrategy - TTTStrategy, computed from all rows.
+#   TTT reference value = 0.
+TOOL_DELTA_SELECTED_MODELS_ONLY = 0
+
+# Used only when TOOL_DELTA_SELECTED_MODELS_ONLY = 1.
+# Matching is done on both the display label and the raw llm_model value.
+TOOL_DELTA_SELECTED_MODEL_KEYWORDS = [
+    "gemini-3.1-pro-preview",
+    "Gemini 3.1 Pro Preview",
+    "Gemini 3.1 Pro",
+    "deepseek-v4-pro",
+    "Deepseek-v4-Pro",
+    "DeepSeek-v4-Pro",
+]
 
 # Colors are assigned by order of first appearance in the CSV.
 # If two model labels differ only by text inside parentheses, they use the same base color,
@@ -147,6 +175,19 @@ MODEL_DISPLAY_NAMES = {
     "deepseek:deepseek-v4-pro": "Deepseek-v4-Pro",
     "deepseek:deepseek-reasoner": "DeepSeek-V3.2 (thinking)",
     "together:menagedreef_265f/meta-llama/Llama-3.3-70B-Instruct-Turbo-5f2c0da6": "Llama-3.3-70B-Instruct-Turbo",
+}
+
+# Fixed model colors requested by the user.
+# These override the automatic palette for the listed display names.
+FIXED_MODEL_COLORS_FROM_USER_CODE = {
+    "Gemini 3.1 Pro Preview": "tab:orange",
+    "Gemini-3-Flash-Preview (thinking)": "tab:blue",
+    "Gemini-3.1-Flash-Lite-Preview": "tab:green",
+    "GPT-5.4 (without thinking)": "tab:red",
+    "GPT-5.4 (thinking)": "tab:purple",
+    "Deepseek-v4-Pro": "gold",
+    "DeepSeek-V3.2 (thinking)": "brown",
+    "Llama-3.3-70B-Instruct-Turbo": "tab:pink",
 }
 
 EXCLUDE_MODELS = []
@@ -260,11 +301,22 @@ def lighten_color(color, amount):
 
 
 def assign_model_colors(model_labels_in_order):
+    """Assign colors, using the exact user-requested colors when available."""
     base_to_color = OrderedDict()
     base_variant_seen = defaultdict(list)
     label_to_color = {}
 
     for label in model_labels_in_order:
+        label = str(label)
+
+        # First priority: exact colors from the user's older graph script.
+        # The labels here are the display labels after short_model_name(...).
+        if label in FIXED_MODEL_COLORS_FROM_USER_CODE:
+            label_to_color[label] = FIXED_MODEL_COLORS_FROM_USER_CODE[label]
+            continue
+
+        # Fallback: keep the previous automatic palette behavior for any
+        # additional model not listed in FIXED_MODEL_COLORS_FROM_USER_CODE.
         base = strip_parentheses(label)
         if base not in base_to_color:
             base_to_color[base] = BASE_MODEL_COLOR_PALETTE[len(base_to_color) % len(BASE_MODEL_COLOR_PALETTE)]
@@ -594,46 +646,115 @@ def aggregate_similarity(df_models):
     )
 
 
-def aggregate_tool_calls(df_models):
-    if MAX_TOOL_CALLS_COLUMN not in df_models.columns:
-        raise ValueError(f"Missing required column for tool graph: {MAX_TOOL_CALLS_COLUMN}")
+def is_successful_llm_query_value(value):
+    s = str(value).strip()
+    if s == "" or s.lower() == "nan" or s.upper() == "X":
+        return False
+    v = pd.to_numeric(s, errors="coerce")
+    return pd.notna(v) and np.isfinite(v)
 
+
+def should_keep_model_in_tool_delta_graph(model_label, raw_model_name=None):
+    """
+    Return True if this row should appear in the Δ Tool Calls from TTT graph.
+
+    TOOL_DELTA_SELECTED_MODELS_ONLY = 0:
+        keep every model.
+
+    TOOL_DELTA_SELECTED_MODELS_ONLY = 1:
+        keep only Gemini Pro and Deepseek Pro.
+        The check uses both:
+          1. the display label after MODEL_DISPLAY_NAMES
+          2. the raw llm_model value from the CSV
+    """
+    if TOOL_DELTA_SELECTED_MODELS_ONLY == 0:
+        return True
+
+    haystack = f"{model_label} {raw_model_name if raw_model_name is not None else ''}".lower()
+    return any(keyword.lower() in haystack for keyword in TOOL_DELTA_SELECTED_MODEL_KEYWORDS)
+
+
+def aggregate_tool_calls(df_models):
+    """
+    Aggregate Δ tool calls from TTT for successful model runs only.
+
+    For every successful LLM row:
+        Δ = llm_total_queries - TTTStrategy
+
+    Failed rows are excluded here because the graph is intended to compare
+    actual successful learning cost against TTT.
+    """
     df_tool = df_models.copy()
-    df_tool[MAX_TOOL_CALLS_COLUMN] = pd.to_numeric(df_tool[MAX_TOOL_CALLS_COLUMN], errors="coerce")
-    df_tool["tool_calls"] = df_tool.apply(
-        lambda row: parse_llm_total_queries(row[LLM_TOTAL_QUERIES_COLUMN], row[MAX_TOOL_CALLS_COLUMN]),
-        axis=1,
-    )
-    df_tool = df_tool.dropna(subset=["tool_calls"]).copy()
+
+    # Keep only successful LLM rows: llm_total_queries must be numeric, not X.
+    df_tool = df_tool[df_tool[LLM_TOTAL_QUERIES_COLUMN].apply(is_successful_llm_query_value)].copy()
+    if df_tool.empty:
+        return pd.DataFrame(columns=["model_label", "x_group", "mean_value", "std_value", "runs"])
+
+    df_tool["model_label"] = df_tool["model_label"].astype(str)
+
+    # Optional two-model view for the Δ graph only.
+    df_tool = df_tool[
+        df_tool.apply(
+            lambda row: should_keep_model_in_tool_delta_graph(
+                row.get("model_label", ""),
+                row.get(MODEL_COLUMN, ""),
+            ),
+            axis=1,
+        )
+    ].copy()
+    if df_tool.empty:
+        return pd.DataFrame(columns=["model_label", "x_group", "mean_value", "std_value", "runs"])
+
+    df_tool["tool_calls"] = pd.to_numeric(df_tool[LLM_TOTAL_QUERIES_COLUMN], errors="coerce")
+    df_tool["ttt_queries"] = df_tool[STRATEGIES_COLUMN].apply(lambda v: parse_strategy_queries(v, "TTTStrategy"))
+    df_tool["tool_delta_from_ttt"] = df_tool["tool_calls"] - df_tool["ttt_queries"]
+
+    df_tool = df_tool.dropna(subset=["tool_delta_from_ttt", "x_group", "model_label"]).copy()
+
     return (
         df_tool.groupby(["model_label", "x_group"], as_index=False)
-        .agg(mean_value=("tool_calls", "mean"), std_value=("tool_calls", "std"), runs=("tool_calls", "size"))
+        .agg(
+            mean_value=("tool_delta_from_ttt", "mean"),
+            std_value=("tool_delta_from_ttt", "std"),
+            runs=("tool_delta_from_ttt", "size"),
+        )
     )
 
-
 def aggregate_baselines_from_all_rows(df_all):
-    # Important: L* and TTT are computed from every row in the table, not from a specific model.
+    # L* and TTT are computed from every row in the table.
+    # For the delta graph, TTT is the zero reference and L* is L* - TTT.
     df_base = df_all.copy()
     df_base["lstar_queries"] = df_base[STRATEGIES_COLUMN].apply(lambda v: parse_strategy_queries(v, "LStarStrategy"))
     df_base["ttt_queries"] = df_base[STRATEGIES_COLUMN].apply(lambda v: parse_strategy_queries(v, "TTTStrategy"))
+    df_base["lstar_delta_from_ttt"] = df_base["lstar_queries"] - df_base["ttt_queries"]
+    df_base["ttt_delta_from_ttt"] = 0.0
 
     lstar = (
-        df_base.dropna(subset=["lstar_queries"])
+        df_base.dropna(subset=["lstar_delta_from_ttt"])
         .groupby("x_group", as_index=False)
-        .agg(mean=("lstar_queries", "mean"), std=("lstar_queries", "std"), runs=("lstar_queries", "size"))
+        .agg(mean=("lstar_delta_from_ttt", "mean"), std=("lstar_delta_from_ttt", "std"), runs=("lstar_delta_from_ttt", "size"))
     )
     ttt = (
-        df_base.dropna(subset=["ttt_queries"])
+        df_base.dropna(subset=["ttt_delta_from_ttt"])
         .groupby("x_group", as_index=False)
-        .agg(mean=("ttt_queries", "mean"), std=("ttt_queries", "std"), runs=("ttt_queries", "size"))
+        .agg(mean=("ttt_delta_from_ttt", "mean"), std=("ttt_delta_from_ttt", "std"), runs=("ttt_delta_from_ttt", "size"))
     )
 
     lstar["std"] = lstar["std"].fillna(0.0)
     ttt["std"] = ttt["std"].fillna(0.0)
     return lstar, ttt
 
-
 def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_label, y_max, value_multiplier=100.0):
+    """
+    Draw grouped bars, but center the bars inside each x-group according to the
+    number of bars that are actually visible in that group.
+
+    Important change:
+    If only two models have value > 0 for a specific number-of-states group,
+    only those two bars are drawn and they are centered around that group's
+    tick. Models with 0 / NaN do not reserve empty horizontal slots.
+    """
     fig, ax = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
 
     x = np.arange(len(x_order), dtype=float)
@@ -643,44 +764,57 @@ def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_lab
     data_span = max(float(len(x_order)), 1.0)
     max_bar_width_data = (30.0 * data_span / axis_px) / 0.92
     bar_width = min(0.11, BAR_GROUP_WIDTH / n_models, max_bar_width_data)
-    offsets = (np.arange(n_models) - (n_models - 1) / 2) * bar_width
 
     hover_artists = []
     artist_to_text = {}
+    legend_models_seen = set()
 
-    for i, model in enumerate(model_order):
-        model_df = agg[agg["model_label"] == model]
-        y_values = []
-        std_values = []
-        runs_values = []
-
-        for group in x_order:
+    # Cache values so each group can decide how many non-zero bars it contains.
+    values_by_group_model = {}
+    for group in x_order:
+        values_by_group_model[group] = {}
+        for model in model_order:
+            model_df = agg[agg["model_label"] == model]
             row = model_df[model_df["x_group"] == group]
             if row.empty:
-                y_values.append(np.nan)
-                std_values.append(np.nan)
-                runs_values.append(np.nan)
+                values_by_group_model[group][model] = (np.nan, np.nan, np.nan)
             else:
-                y_values.append(float(row.iloc[0]["mean_value"]) * value_multiplier)
-                std_values.append(float(row.iloc[0]["std_value"] if pd.notna(row.iloc[0]["std_value"]) else 0.0) * value_multiplier)
-                runs_values.append(float(row.iloc[0]["runs"]))
+                yi = float(row.iloc[0]["mean_value"]) * value_multiplier
+                si = float(row.iloc[0]["std_value"] if pd.notna(row.iloc[0]["std_value"]) else 0.0) * value_multiplier
+                runs = float(row.iloc[0]["runs"])
+                values_by_group_model[group][model] = (yi, si, runs)
 
-        xpos = x + offsets[i]
-        bars = ax.bar(
-            xpos,
-            y_values,
-            width=bar_width * 0.92,
-            label=model,
-            color=model_colors[model],
-            edgecolor="black",
-            linewidth=0.55,
-            alpha=0.9,
-            zorder=3,
-        )
+    for group_idx, group in enumerate(x_order):
+        visible_models = []
+        for model in model_order:
+            yi, si, runs = values_by_group_model[group][model]
+            # Center according to bars that have real positive height.
+            # Zero-height bars are intentionally not drawn and do not reserve space.
+            if np.isfinite(yi) and yi > 0:
+                visible_models.append(model)
 
-        for group, bar, yi, si, runs in zip(x_order, bars, y_values, std_values, runs_values):
-            if not np.isfinite(yi):
-                continue
+        n_visible = len(visible_models)
+        if n_visible == 0:
+            continue
+
+        offsets = (np.arange(n_visible) - (n_visible - 1) / 2) * bar_width
+
+        for local_idx, model in enumerate(visible_models):
+            yi, si, runs = values_by_group_model[group][model]
+            xpos = x[group_idx] + offsets[local_idx]
+            bar = ax.bar(
+                xpos,
+                yi,
+                width=bar_width * 0.92,
+                label=model if model not in legend_models_seen else "_nolegend_",
+                color=model_colors[model],
+                edgecolor="black",
+                linewidth=0.55,
+                alpha=0.9,
+                zorder=3,
+            )[0]
+            legend_models_seen.add(model)
+
             hover_artists.append(bar)
             artist_to_text[bar] = (
                 f"{model}\n"
@@ -690,14 +824,11 @@ def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_lab
                 f"runs={fmt_num(runs, 0)}"
             )
 
-        if SHOW_ERROR_BARS and SHOW_SUCCESS_ERROR_BARS:
-            for xi, yi, si in zip(xpos, y_values, std_values):
-                if not np.isfinite(yi) or not np.isfinite(si):
-                    continue
+            if SHOW_ERROR_BARS and SHOW_SUCCESS_ERROR_BARS and np.isfinite(si):
                 lower = min(si, yi)
                 upper = min(si, max(0.0, y_max - yi)) if y_max is not None else si
                 ax.errorbar(
-                    xi,
+                    xpos,
                     yi,
                     yerr=np.array([[lower], [upper]]),
                     fmt="none",
@@ -714,12 +845,16 @@ def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_lab
     ax.set_xticks(x)
     ax.set_xticklabels([format_x_tick_label(g) for g in x_order])
     if len(x_order) == 1:
-        # Cap the visual width of a single vertical bar at about 30 pixels.
-        # This keeps one-run / one-state graphs from filling the whole plot.
         fig.canvas.draw()
         axis_px = max(float(ax.bbox.width), 1.0)
         drawn_bar_data_width = max(float(bar_width * 0.92), 1e-6)
-        full_group_data_width = max(float(bar_width * (n_models - 1) + drawn_bar_data_width), drawn_bar_data_width)
+        max_visible = max(
+            [sum(
+                1 for model in model_order
+                if np.isfinite(values_by_group_model[group][model][0]) and values_by_group_model[group][model][0] > 0
+            ) for group in x_order] or [1]
+        )
+        full_group_data_width = max(float(bar_width * (max_visible - 1) + drawn_bar_data_width), drawn_bar_data_width)
         span_for_30px = drawn_bar_data_width * axis_px / 30.0
         span = max(span_for_30px, full_group_data_width * 1.35, 1.0)
         ax.set_xlim(-span / 2.0, span / 2.0)
@@ -731,35 +866,54 @@ def draw_grouped_bar_graph(agg, model_order, model_colors, x_order, title, y_lab
     ax.set_axisbelow(True)
 
     if SHOW_LEGENDS:
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.22), ncol=3, fontsize=8, frameon=True)
+        legend_handles = [
+            Line2D([0], [0], marker="s", linestyle="none", markersize=8,
+                   markerfacecolor=model_colors[model], markeredgecolor="black", label=model)
+            for model in model_order
+            if model in legend_models_seen
+        ]
+        if legend_handles:
+            ax.legend(
+                legend_handles,
+                [h.get_label() for h in legend_handles],
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.22),
+                ncol=3,
+                fontsize=8,
+                frameon=True,
+            )
 
     add_hover_cursor(hover_artists, artist_to_text)
     plt.tight_layout()
     return fig, ax
 
 def draw_tool_calls_graph(agg_tool, model_order, model_colors, x_order, agg_lstar, agg_ttt):
-    y_max = TOOL_Y_MAX
-    if y_max is None:
-        vals = []
-        vals.extend((agg_tool["mean_value"] + agg_tool["std_value"].fillna(0.0)).dropna().tolist())
-        vals.extend((agg_lstar["mean"] + agg_lstar["std"].fillna(0.0)).dropna().tolist())
-        vals.extend((agg_ttt["mean"] + agg_ttt["std"].fillna(0.0)).dropna().tolist())
-        y_max = max(vals) * 1.12 if vals else 100
-
+    """Draw Δ tool calls from TTT as a line graph with shaded std background."""
     fig, ax = plt.subplots(figsize=(FIG_WIDTH, FIG_HEIGHT))
     x = np.arange(len(x_order), dtype=float)
-    n_models = max(len(model_order), 1)
-    bar_width = min(0.11, BAR_GROUP_WIDTH / n_models)
-    offsets = (np.arange(n_models) - (n_models - 1) / 2) * bar_width
 
     hover_artists = []
     artist_to_text = {}
+    model_legend_handles = []
+    model_legend_labels = []
+    classical_legend_handles = []
+    classical_legend_labels = []
 
-    for i, model in enumerate(model_order):
+    # In mode 1, the tool graph can contain fewer models than the other graphs.
+    # Keep the same model names/order used in the success graph legend.
+    tool_model_order = [
+        model for model in model_order
+        if model in set(agg_tool["model_label"].astype(str).tolist())
+    ]
+
+    all_y_values = [0.0]
+
+    for model in tool_model_order:
         model_df = agg_tool[agg_tool["model_label"] == model]
         y_values = []
         std_values = []
         runs_values = []
+        group_values = []
 
         for group in x_order:
             row = model_df[model_df["x_group"] == group]
@@ -771,118 +925,207 @@ def draw_tool_calls_graph(agg_tool, model_order, model_colors, x_order, agg_lsta
                 y_values.append(float(row.iloc[0]["mean_value"]))
                 std_values.append(float(row.iloc[0]["std_value"] if pd.notna(row.iloc[0]["std_value"]) else 0.0))
                 runs_values.append(float(row.iloc[0]["runs"]))
+            group_values.append(group)
 
-        xpos = x + offsets[i]
-        bars = ax.bar(
-            xpos,
-            y_values,
-            width=bar_width * 0.92,
+        y = np.array(y_values, dtype=float)
+        std = np.array(std_values, dtype=float)
+        runs_arr = np.array(runs_values, dtype=float)
+        valid = np.isfinite(y)
+        if not valid.any():
+            continue
+
+        xv = x[valid]
+        yv = y[valid]
+        sv = np.where(np.isfinite(std[valid]), std[valid], 0.0)
+        rv = runs_arr[valid]
+        gv = np.array(group_values, dtype=object)[valid]
+        color = model_colors.get(model, None)
+        all_y_values.extend((yv + sv).tolist())
+        all_y_values.extend((yv - sv).tolist())
+
+        # Standard deviation is shown as a shaded band behind the line.
+        if SHOW_ERROR_BARS and SHOW_TOOL_ERROR_BARS:
+            ax.fill_between(
+                xv,
+                yv - sv,
+                yv + sv,
+                color=color,
+                alpha=0.15,
+                linewidth=0,
+                zorder=2,
+            )
+
+        line = ax.plot(
+            xv,
+            yv,
+            color=color,
+            linewidth=2.2,
+            marker="o",
+            markersize=5.0,
             label=model,
-            color=model_colors[model],
-            edgecolor="black",
-            linewidth=0.55,
-            alpha=0.9,
-            zorder=3,
+            zorder=4,
+        )[0]
+        hover_artists.append(line)
+        model_legend_handles.append(line)
+        model_legend_labels.append(model)
+
+        def make_tool_hover(model_name, xv_local, yv_local, sv_local, rv_local, gv_local):
+            def _text(event):
+                if event.xdata is None or len(xv_local) == 0:
+                    idx = 0
+                else:
+                    idx = int(np.argmin(np.abs(xv_local - event.xdata)))
+                return (
+                    f"{model_name}\n"
+                    f"states={format_x_tick_label(gv_local[idx])}\n"
+                    f"Δ tool calls from TTT={fmt_num(yv_local[idx])}\n"
+                    f"std={fmt_num(sv_local[idx])}\n"
+                    f"successful runs={fmt_num(rv_local[idx], 0)}"
+                )
+            return _text
+
+        artist_to_text[line] = make_tool_hover(model, xv, yv, sv, rv, gv)
+
+    def baseline_series(agg_base):
+        y_values = []
+        std_values = []
+        runs_values = []
+        group_values = []
+        for group in x_order:
+            row = agg_base[agg_base["x_group"] == group]
+            if row.empty:
+                y_values.append(np.nan)
+                std_values.append(np.nan)
+                runs_values.append(np.nan)
+            else:
+                y_values.append(float(row.iloc[0]["mean"]))
+                std_values.append(float(row.iloc[0]["std"] if pd.notna(row.iloc[0]["std"]) else 0.0))
+                runs_values.append(float(row.iloc[0]["runs"]))
+            group_values.append(group)
+        return (
+            np.asarray(y_values, dtype=float),
+            np.asarray(std_values, dtype=float),
+            np.asarray(runs_values, dtype=float),
+            np.asarray(group_values, dtype=object),
         )
 
-        for group, bar, yi, si, runs in zip(x_order, bars, y_values, std_values, runs_values):
-            if not np.isfinite(yi):
-                continue
-            hover_artists.append(bar)
-            artist_to_text[bar] = (
-                f"{model}\n"
-                f"states={format_x_tick_label(group)}\n"
-                f"avg tool calls={fmt_num(yi)}\n"
-                f"std={fmt_num(si)}\n"
-                f"runs={fmt_num(runs, 0)}"
+    # TTT is the classical zero-reference line. No separate axhline(0) is drawn.
+    y_ttt, std_ttt, runs_ttt, groups_ttt = baseline_series(agg_ttt)
+    valid_ttt = np.isfinite(y_ttt)
+    if valid_ttt.any():
+        ttt_line = ax.plot(
+            x[valid_ttt],
+            y_ttt[valid_ttt],
+            color="0.45",
+            linestyle=(0, (3, 3)),
+            linewidth=1.7,
+            label=TTT_LABEL,
+            zorder=3,
+        )[0]
+        hover_artists.append(ttt_line)
+        classical_legend_handles.append(ttt_line)
+        classical_legend_labels.append(TTT_LABEL)
+        artist_to_text[ttt_line] = f"{TTT_LABEL}\nΔ tool calls from TTT=0"
+
+    # L* delta from TTT, using all rows.
+    y_lstar, std_lstar, runs_lstar, groups_lstar = baseline_series(agg_lstar)
+    valid_lstar = np.isfinite(y_lstar)
+    if valid_lstar.any():
+        all_y_values.extend((y_lstar[valid_lstar] + std_lstar[valid_lstar]).tolist())
+        all_y_values.extend((y_lstar[valid_lstar] - std_lstar[valid_lstar]).tolist())
+
+        if SHOW_ERROR_BARS and SHOW_BASELINE_ERROR_BARS:
+            ax.fill_between(
+                x[valid_lstar],
+                y_lstar[valid_lstar] - std_lstar[valid_lstar],
+                y_lstar[valid_lstar] + std_lstar[valid_lstar],
+                color="black",
+                alpha=0.10,
+                linewidth=0,
+                zorder=1,
             )
 
-        # The tool-call graph shows variance/std bars when enabled.
-        if SHOW_ERROR_BARS and SHOW_TOOL_ERROR_BARS:
-            for xi, yi, si in zip(xpos, y_values, std_values):
-                if not np.isfinite(yi) or not np.isfinite(si):
-                    continue
-                lower = min(si, yi)
-                upper = min(si, max(0.0, y_max - yi))
-                ax.errorbar(
-                    xi,
-                    yi,
-                    yerr=np.array([[lower], [upper]]),
-                    fmt="none",
-                    ecolor="black",
-                    elinewidth=1.0,
-                    capsize=3,
-                    capthick=1.0,
-                    zorder=4,
+        lstar_line = ax.plot(
+            x[valid_lstar],
+            y_lstar[valid_lstar],
+            color="black",
+            linestyle=(0, (3, 3)),
+            linewidth=1.7,
+            label=LSTAR_LABEL,
+            zorder=3,
+        )[0]
+        hover_artists.append(lstar_line)
+        classical_legend_handles.append(lstar_line)
+        classical_legend_labels.append(LSTAR_LABEL)
+
+        def make_lstar_hover(xv_local, yv_local, sv_local, rv_local, gv_local):
+            def _text(event):
+                if event.xdata is None or len(xv_local) == 0:
+                    idx = 0
+                else:
+                    idx = int(np.argmin(np.abs(xv_local - event.xdata)))
+                return (
+                    f"{LSTAR_LABEL}\n"
+                    f"states={format_x_tick_label(gv_local[idx])}\n"
+                    f"Δ tool calls from TTT={fmt_num(yv_local[idx])}\n"
+                    f"std={fmt_num(sv_local[idx])}\n"
+                    f"runs={fmt_num(rv_local[idx], 0)}"
                 )
+            return _text
 
-    x_centers = {group: idx for idx, group in enumerate(x_order)}
+        artist_to_text[lstar_line] = make_lstar_hover(
+            x[valid_lstar], y_lstar[valid_lstar], std_lstar[valid_lstar], runs_lstar[valid_lstar], groups_lstar[valid_lstar]
+        )
 
-    def draw_baseline(agg_base, label, color):
-        for _, row in agg_base.iterrows():
-            group = row["x_group"]
-            if group not in x_centers:
-                continue
-            center = x_centers[group]
-            y = float(row["mean"])
-            std = float(row["std"] if pd.notna(row["std"]) else 0.0)
-            runs = float(row["runs"] if pd.notna(row["runs"]) else 0.0)
-            line = ax.plot(
-                [center - BAR_GROUP_WIDTH / 2, center + BAR_GROUP_WIDTH / 2],
-                [y, y],
-                color=color,
-                linestyle=(0, (3, 3)),
-                linewidth=1.7,
-                zorder=5,
-            )[0]
-            hover_artists.append(line)
-            artist_to_text[line] = (
-                f"{label}\n"
-                f"states={format_x_tick_label(group)}\n"
-                f"avg tool calls={fmt_num(y)}\n"
-                f"std={fmt_num(std)}\n"
-                f"runs={fmt_num(runs, 0)}"
-            )
-
-            if SHOW_BASELINE_ERROR_BARS:
-                ax.errorbar(
-                    center - BAR_GROUP_WIDTH / 2 + 0.06,
-                    y,
-                    yerr=np.array([[min(std, y)], [min(std, max(0.0, y_max - y))]]),
-                    fmt="none",
-                    ecolor="black",
-                    elinewidth=1.0,
-                    capsize=3,
-                    capthick=1.0,
-                    zorder=6,
-                )
-
-    draw_baseline(agg_ttt, TTT_LABEL, "black")
-    draw_baseline(agg_lstar, LSTAR_LABEL, "0.45")
+    finite_y = [v for v in all_y_values if np.isfinite(v)]
+    if finite_y:
+        y_min = min(finite_y)
+        y_max = max(finite_y)
+        pad = max((y_max - y_min) * 0.12, 2.0)
+        ax.set_ylim(y_min - pad, y_max + pad)
+    if TOOL_Y_MAX is not None:
+        upper = max(TOOL_Y_MAX, 1.0)
+        lower = min(ax.get_ylim()[0], 0.0)
+        ax.set_ylim(lower, upper)
 
     ax.set_title(TOOL_GRAPH_TITLE, fontsize=14, fontweight="bold")
     ax.set_xlabel(X_AXIS_LABEL, fontsize=12)
     ax.set_ylabel(TOOL_Y_LABEL, fontsize=12)
     ax.set_xticks(x)
     ax.set_xticklabels([format_x_tick_label(g) for g in x_order])
-    ax.set_ylim(0, y_max)
+    if len(x_order) > 1:
+        ax.set_xlim(-0.15, len(x_order) - 0.85)
     ax.grid(axis="y", alpha=0.28)
     ax.set_axisbelow(True)
 
-    handles, labels = ax.get_legend_handles_labels()
-    handles.extend([
-        Line2D([0], [0], color="black", linestyle=(0, (3, 3)), linewidth=1.7, label=TTT_LABEL),
-        Line2D([0], [0], color="0.45", linestyle=(0, (3, 3)), linewidth=1.7, label=LSTAR_LABEL),
-    ])
-    labels.extend([TTT_LABEL, LSTAR_LABEL])
-
     if SHOW_LEGENDS:
-        ax.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 1.22), ncol=3, fontsize=8, frameon=True)
+        if model_legend_handles:
+            model_legend = ax.legend(
+                model_legend_handles,
+                model_legend_labels,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.22),
+                ncol=3,
+                fontsize=8,
+                frameon=True,
+            )
+            ax.add_artist(model_legend)
+        if classical_legend_handles:
+            ax.legend(
+                classical_legend_handles,
+                classical_legend_labels,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.98),
+                ncol=2,
+                fontsize=8,
+                frameon=True,
+                title="Classical algorithms",
+                title_fontsize=8,
+            )
 
     add_hover_cursor(hover_artists, artist_to_text)
     plt.tight_layout()
     return fig, ax
-
 
 def draw_similarity_line_graph(agg_similarity, model_order, model_colors, x_order):
     """Draw similarity like the appendix figure: lines + shaded one-std region."""
@@ -1415,8 +1658,10 @@ def build_noninformative_query_points(df_models):
             except Exception:
                 continue
 
-            # In the original graph, query_step = step_metrics key + 1.
-            query_step = step_metrics_key_int + 1
+            # Use the actual interaction step. Do NOT add +1.
+            # Otherwise the final measured step becomes an extra fake next step,
+            # for example step 38 is shifted to 39 and can create a false drop.
+            query_step = step_metrics_key_int
 
             rows.append({
                 "row_index": row_index,
@@ -1456,18 +1701,39 @@ def aggregate_noninformative_by_step(df_models):
     return grouped
 
 
-def smooth_noninformative_values(y_values):
+def smooth_noninformative_values(y_values, x_values=None):
+    """
+    Smooth only over steps that actually exist in the aggregated data.
+
+    Important: we do NOT create missing steps between existing x-values.
+    For example, if the data has steps 35 and 38 but no 36/37, the smoothing
+    treats 35 and 38 as neighboring observed points. Missing steps never enter
+    the Gaussian filter as zeros and never pull the curve down.
+
+    Also, because build_noninformative_query_points now uses the real step
+    number without +1, a last non-informative query at step 38 stays at step 38;
+    no artificial step 39 with value 0 is created.
+    """
     y_values = np.asarray(y_values, dtype=float)
+
     if NONINFORMATIVE_STEP_SMOOTHING_SIGMA is None or NONINFORMATIVE_STEP_SMOOTHING_SIGMA <= 0:
         return y_values
-    if len(y_values) < 3:
+
+    valid = np.isfinite(y_values)
+    if valid.sum() < 3:
         return y_values
-    return gaussian_filter1d(
-        y_values,
+
+    # Smooth the compact sequence of observed values only.
+    observed = y_values[valid]
+    smoothed_observed = gaussian_filter1d(
+        observed,
         sigma=NONINFORMATIVE_STEP_SMOOTHING_SIGMA,
         mode="nearest",
     )
 
+    out = np.full_like(y_values, np.nan, dtype=float)
+    out[valid] = smoothed_observed
+    return out
 
 def draw_noninformative_by_step_graph(df_models, model_order, model_colors):
     step_df = aggregate_noninformative_by_step(df_models)
@@ -1487,7 +1753,7 @@ def draw_noninformative_by_step_graph(df_models, model_order, model_colors):
         model_df = model_df.sort_values("query_step")
         x_values = model_df["query_step"].to_numpy()
         raw_y_values = model_df["directly_noninformative_percent"].to_numpy()
-        y_values = smooth_noninformative_values(raw_y_values)
+        y_values = smooth_noninformative_values(raw_y_values, x_values)
         total_queries = model_df["total_queries"].to_numpy()
         noninfo_queries = model_df["directly_noninformative_queries"].to_numpy()
 
@@ -1691,10 +1957,13 @@ def draw_task_outcomes_stacked_bar(df_models):
     # Keep the same model order used elsewhere in the PDF.
     models = order_task_outcome_models_by_success(tmp)
 
-    # Keep the original graph width. Limit only the visual thickness of each
-    # horizontal bar so a single model/run does not create an oversized bar.
+    # Keep the original graph width, but limit every horizontal bar to about
+    # 30 pixels, no matter how many model rows are shown.
     fig, ax = plt.subplots(figsize=(FIG_WIDTH, max(5, len(models) * 0.6)))
-    outcome_bar_height = 0.45
+    fig.canvas.draw()
+    axis_px = max(float(ax.bbox.height), 1.0)
+    y_span = max(float(len(models)), 1.0)
+    outcome_bar_height = min(0.45, 30.0 * y_span / axis_px)
 
     left = np.zeros(len(models))
 
@@ -1728,12 +1997,8 @@ def draw_task_outcomes_stacked_bar(df_models):
     ax.grid(axis="x", alpha=0.25)
     ax.invert_yaxis()
     if len(models) == 1:
-        # Cap the visual thickness of a single horizontal bar at about 30 px.
-        fig.canvas.draw()
-        axis_px = max(float(ax.bbox.height), 1.0)
-        span_for_30px = outcome_bar_height * axis_px / 30.0
-        span = max(span_for_30px, 1.0)
-        ax.set_ylim(span / 2.0, -span / 2.0)
+        # Keep enough empty vertical space around the single capped bar.
+        ax.set_ylim(0.5, -0.5)
     ax.set_xticks([t for t in range(0, 101, 10)])
     ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.12), ncol=3)
 
@@ -1741,7 +2006,12 @@ def draw_task_outcomes_stacked_bar(df_models):
     return fig, ax
 
 
-def main(csv_path, output_pdf_path=PDF_OUTPUT_PATH):
+def main(csv_path, output_pdf_path=PDF_OUTPUT_PATH, tool_delta_selected_models_only=None):
+    global TOOL_DELTA_SELECTED_MODELS_ONLY
+
+    if tool_delta_selected_models_only is not None:
+        TOOL_DELTA_SELECTED_MODELS_ONLY = int(tool_delta_selected_models_only)
+
     output_pdf_path = resolve_output_pdf_path(csv_path, output_pdf_path)
     df_all = load_and_prepare(csv_path)
     df_models = model_rows(df_all)
@@ -1847,5 +2117,15 @@ if __name__ == "__main__":
         default=PDF_OUTPUT_PATH,
         help="Path for the combined output PDF. If omitted, saves next to the CSV file.",
     )
+    parser.add_argument(
+        "--tool-delta-selected-models-only",
+        type=int,
+        choices=[0, 1],
+        default=None,
+        help=(
+            "Override TOOL_DELTA_SELECTED_MODELS_ONLY for the Δ Tool Calls from TTT graph. "
+            "0 = all models, 1 = only Gemini Pro and Deepseek Pro."
+        ),
+    )
     args = parser.parse_args()
-    main(args.csv_path, args.output_pdf)
+    main(args.csv_path, args.output_pdf, args.tool_delta_selected_models_only)
