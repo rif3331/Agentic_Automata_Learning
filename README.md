@@ -1,6 +1,6 @@
 # Agentic Automata Learning
 
-[![Website](https://img.shields.io/badge/website-blue.svg)]([https://agentic-automata-learning.onrender.com](https://reefmenaged.github.io/Agentic_Automata_Learning))
+[![Website]([https://agentic-automata-learning.onrender.com](https://reefmenaged.github.io/Agentic_Automata_Learning))
 
 Agentic Automata Learning is an evaluation framework for studying Large Language Model (LLM) agents. The framework investigates whether agents can infer a hidden structure of an environment through interaction, information gathering, and iterative hypothesis refinement.
 
